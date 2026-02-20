@@ -1,0 +1,12 @@
+tsar $WORK/simple.tsar
+
+-- simple.tsar --
+# Simple test that creates and verifies a file
+mkdir hello
+cd hello
+
+-- world.txt --
+Hello, World!
+
+exists world.txt
+grep "Hello, World!" world.txt

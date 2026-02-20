@@ -1,0 +1,5 @@
+tsar $WORK/single_test.tsar
+
+-- single_test.tsar --
+mkdir test_directory
+exists test_directory

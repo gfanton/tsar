@@ -1,4 +1,4 @@
-module github.com/gfanton/testscript
+module github.com/gfanton/tstar
 
 go 1.23.11
 

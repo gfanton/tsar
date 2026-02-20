@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gfanton/testscript"
+	"github.com/gfanton/tstar"
 	"github.com/peterbourgon/ff/v4"
 )
 
@@ -18,7 +18,7 @@ type config struct {
 	short               bool
 	testWork            bool
 	workdirRoot         string
-	contineOnError      bool
+	continueOnError     bool
 	requireExplicitExec bool
 	requireUniqueNames  bool
 }
@@ -28,28 +28,16 @@ func (cfg *config) registerFlags(fs *ff.FlagSet) {
 	fs.BoolVar(&cfg.short, 's', "short", "run tests in short mode")
 	fs.BoolVar(&cfg.testWork, 0, "test-work", "preserve work directories after tests")
 	fs.StringVar(&cfg.workdirRoot, 'w', "workdir-root", "", "root directory for work directories")
-	fs.BoolVar(&cfg.contineOnError, 'c', "continue-on-error", "continue executing tests after an error")
+	fs.BoolVar(&cfg.continueOnError, 'c', "continue-on-error", "continue executing tests after an error")
 	fs.BoolVar(&cfg.requireExplicitExec, 'e', "require-explicit-exec", "require explicit 'exec' for command execution")
 	fs.BoolVar(&cfg.requireUniqueNames, 'u', "require-unique-names", "require unique test names")
 }
 
 func main() {
-	var cfg config
-
-	fs := ff.NewFlagSet("tsar")
-	cfg.registerFlags(fs)
-
-	tsCmd := &ff.Command{
-		Name:  "tsar",
-		Usage: "tsar [FLAGS] SUBCOMMAND ...",
-		Flags: fs,
-		Exec: func(ctx context.Context, args []string) error {
-			return execTestRunner(ctx, &cfg, args)
-		},
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	tsCmd := NewCommand()
 
 	// Parse flags with ff for environment variable support
 	if err := tsCmd.ParseAndRun(ctx, os.Args[1:], ff.WithEnvVarPrefix("TSAR")); err != nil {
@@ -58,14 +46,26 @@ func main() {
 	}
 }
 
-func execTestRunner(ctx context.Context, cfg *config, args []string) error {
-	// Initialize testing framework properly
-	// We need to call flag.Parse() with empty args to initialize testing flags
-	os.Args = []string{os.Args[0]} // Keep only program name
+// NewCommand creates the root ff.Command for the tsar CLI.
+func NewCommand() *ff.Command {
+	var cfg config
 
-	// Use the manually separated non-flag arguments
+	fs := ff.NewFlagSet("tsar")
+	cfg.registerFlags(fs)
+
+	return &ff.Command{
+		Name:  "tsar",
+		Usage: "tsar [FLAGS] SUBCOMMAND ...",
+		Flags: fs,
+		Exec: func(ctx context.Context, args []string) error {
+			return execTestRunner(ctx, &cfg, args)
+		},
+	}
+}
+
+func execTestRunner(ctx context.Context, cfg *config, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("not enough argument")
+		return fmt.Errorf("at least one argument required")
 	}
 
 	target := args[0]
@@ -73,15 +73,16 @@ func execTestRunner(ctx context.Context, cfg *config, args []string) error {
 	// Determine if target is a file or directory
 	info, err := os.Stat(target)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot access %s: %v\n", target, err)
-		os.Exit(1)
+		return fmt.Errorf("cannot access %s: %w", target, err)
 	}
 
+	// Initialize testing framework with minimal os.Args
 	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
 	os.Args = []string{"tsar"}
 	flag.Parse()
 	testing.Init()
-	
+
 	// Set up test flags after testing.Init()
 	if cfg.short {
 		flag.Set("test.short", "true")
@@ -90,13 +91,12 @@ func execTestRunner(ctx context.Context, cfg *config, args []string) error {
 	if cfg.verbose {
 		flag.Set("test.v", "true")
 	}
-	os.Args = oldArgs
 
 	// Create parameters for testscript
-	params := testscript.Params{
+	params := tstar.Params{
 		TestWork:            cfg.testWork,
 		WorkdirRoot:         cfg.workdirRoot,
-		ContinueOnError:     cfg.contineOnError,
+		ContinueOnError:     cfg.continueOnError,
 		RequireExplicitExec: cfg.requireExplicitExec,
 		RequireUniqueNames:  cfg.requireUniqueNames,
 	}
@@ -118,7 +118,7 @@ func execTestRunner(ctx context.Context, cfg *config, args []string) error {
 		}
 
 		params.Dir = filepath.Dir(absPath)
-		testscript.RunFilesStandalone(runner, params, absPath)
+		tstar.RunFilesStandalone(runner, params, absPath)
 	} else {
 		// Directory execution
 		absPath, err := filepath.Abs(target)
@@ -127,18 +127,12 @@ func execTestRunner(ctx context.Context, cfg *config, args []string) error {
 		}
 
 		params.Dir = absPath
-		testscript.RunStandalone(runner, params)
+		tstar.RunStandalone(runner, params)
 	}
 
 	if runner.failed {
 		return fmt.Errorf("tests failed")
 	}
-
-	return nil
-}
-
-// run executes the tests
-func (cfg *config) run(target string) error {
 
 	return nil
 }

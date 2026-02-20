@@ -28,16 +28,20 @@
 // environment. The package provides built-in commands for file operations,
 // content checking, and process execution, while allowing users to register
 // their own custom commands.
-package testscript
+package tstar
 
 import (
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -114,10 +118,8 @@ type Env struct {
 // Getenv retrieves the value of the environment variable named by the key.
 func (e *Env) Getenv(key string) string {
 	for _, kv := range e.Values {
-		if i := strings.Index(kv, "="); i >= 0 {
-			if kv[:i] == key {
-				return kv[i+1:]
-			}
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			return v
 		}
 	}
 	return ""
@@ -125,7 +127,14 @@ func (e *Env) Getenv(key string) string {
 
 // Setenv sets the value of the environment variable named by the key.
 func (e *Env) Setenv(key, value string) {
-	e.Values = append(e.Values, key+"="+value)
+	entry := key + "=" + value
+	for i, kv := range e.Values {
+		if k, _, ok := strings.Cut(kv, "="); ok && k == key {
+			e.Values[i] = entry
+			return
+		}
+	}
+	e.Values = append(e.Values, entry)
 }
 
 // TestScript holds execution state for a single test script.
@@ -154,13 +163,12 @@ type TestScript struct {
 }
 
 type backgroundCmd struct {
-	want   actionType
-	args   []string
-	cancel context.CancelFunc
-	wait   <-chan error
+	name   string
+	cmd    *exec.Cmd
+	wait   <-chan struct{}
+	neg    bool
 	stdout strings.Builder
 	stderr strings.Builder
-	neg    bool
 }
 
 type actionType int
@@ -171,21 +179,17 @@ const (
 	actionStop
 )
 
+var backgroundSpecifier = regexp.MustCompile(`^&([a-zA-Z_]\w*)?(&)?$`)
+
 // Run runs the test scripts in the given directory as subtests of t.
-func Run(t TestingT, p Params) {
-	files, err := filepath.Glob(filepath.Join(p.Dir, "*.tsar"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) == 0 {
-		t.Fatal("no test script files found")
-	}
+func Run(t *testing.T, p Params) {
+	files := globTestFiles(t, p.Dir)
 	runFiles(t, p, files)
 }
 
 // RunFiles runs the test scripts with the given file names as subtests of t.
 // The files need not be in the same directory.
-func RunFiles(t TestingT, p Params, filenames ...string) {
+func RunFiles(t *testing.T, p Params, filenames ...string) {
 	runFiles(t, p, filenames)
 }
 
@@ -198,21 +202,16 @@ func RunFilesStandalone(t TestingT, p Params, filenames ...string) {
 // RunStandalone runs the test scripts in the given directory without using t.Run for subtest execution.
 // This is useful for command-line tools that don't need the full testing framework.
 func RunStandalone(t TestingT, p Params) {
-	files, err := filepath.Glob(filepath.Join(p.Dir, "*.tsar"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) == 0 {
-		t.Fatal("no test script files found")
-	}
+	files := globTestFiles(t, p.Dir)
 	runFilesStandalone(t, p, files)
 }
 
-func runFiles(t TestingT, p Params, filenames []string) {
-	type testCase struct {
-		name string
-		file string
-	}
+type testCase struct {
+	name string
+	file string
+}
+
+func buildTestCases(t TestingT, p Params, filenames []string) []testCase {
 	var tests []testCase
 	seen := make(map[string]bool)
 	for _, filename := range filenames {
@@ -225,10 +224,25 @@ func runFiles(t TestingT, p Params, filenames []string) {
 		}
 		tests = append(tests, testCase{name, filename})
 	}
+	return tests
+}
 
+func globTestFiles(t TestingT, dir string) []string {
+	files, err := filepath.Glob(filepath.Join(dir, "*.tsar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no test script files found")
+	}
+	return files
+}
+
+func runFiles(t *testing.T, p Params, filenames []string) {
+	tests := buildTestCases(t, p, filenames)
 	for _, tc := range tests {
 		tc := tc
-		t.(*testing.T).Run(tc.name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			ts := &TestScript{
 				t:       t,
 				name:    tc.name,
@@ -246,72 +260,59 @@ func runFiles(t TestingT, p Params, filenames []string) {
 }
 
 func runFilesStandalone(t TestingT, p Params, filenames []string) {
-	type testCase struct {
-		name string
-		file string
-	}
-	var tests []testCase
-	seen := make(map[string]bool)
-	for _, filename := range filenames {
-		name := strings.TrimSuffix(filepath.Base(filename), ".tsar")
-		if p.RequireUniqueNames {
-			if seen[name] {
-				t.Fatalf("duplicate test name %q", name)
-			}
-			seen[name] = true
-		}
-		tests = append(tests, testCase{name, filename})
-	}
-
+	tests := buildTestCases(t, p, filenames)
 	for _, tc := range tests {
-		t.Logf("=== RUN   %s", tc.name)
-		ts := &TestScript{
-			t:       t,
-			name:    tc.name,
-			file:    tc.file,
-			testDir: filepath.Dir(tc.file),
-			params:  p,
-			builtin: builtinCmds,
-			user:    p.Commands,
-			start:   time.Now(),
-		}
-		defer ts.finalize()
-		ts.run()
-		
-		if t.Failed() {
-			t.Logf("--- FAIL: %s", tc.name)
-			if !p.ContinueOnError {
-				return
+		func() {
+			t.Logf("=== RUN   %s", tc.name)
+			ts := &TestScript{
+				t:       t,
+				name:    tc.name,
+				file:    tc.file,
+				testDir: filepath.Dir(tc.file),
+				params:  p,
+				builtin: builtinCmds,
+				user:    p.Commands,
+				start:   time.Now(),
 			}
-		} else {
-			t.Logf("--- PASS: %s", tc.name)
+			defer ts.finalize()
+			ts.run()
+
+			if t.Failed() {
+				t.Logf("--- FAIL: %s", tc.name)
+			} else {
+				t.Logf("--- PASS: %s", tc.name)
+			}
+		}()
+		if t.Failed() && !p.ContinueOnError {
+			return
 		}
 	}
 }
 
 // setup sets up the test execution temporary directory and environment.
 func (ts *TestScript) setup() {
-	StartTime := time.Now()
+	startTime := time.Now()
 	ts.log.Reset()
 	ts.mark = 0
 	ts.cd = ""
-	ts.name = ""
 	ts.stdout = ""
 	ts.stderr = ""
 	ts.stopped = false
-	ts.start = StartTime
+	ts.start = startTime
 	ts.background = nil
 
-	ts.workdir = filepath.Join(os.TempDir(), "tsar"+fmt.Sprint(os.Getpid())+fmt.Sprint(StartTime.Unix()))
+	root := os.TempDir()
 	if ts.params.WorkdirRoot != "" {
-		ts.workdir = filepath.Join(ts.params.WorkdirRoot, "tsar"+fmt.Sprint(os.Getpid())+fmt.Sprint(StartTime.Unix()))
-	}
-
-	if err := os.MkdirAll(ts.workdir, 0755); err != nil {
-		ts.t.Fatal(err)
-	}
-	if ts.params.WorkdirRoot != "" {
+		root = ts.params.WorkdirRoot
 		ts.params.TestWork = true
+		if err := os.MkdirAll(root, 0755); err != nil {
+			ts.t.Fatal(err)
+		}
+	}
+	var err error
+	ts.workdir, err = os.MkdirTemp(root, "tsar-*")
+	if err != nil {
+		ts.t.Fatal(err)
 	}
 	ts.cd = ts.workdir
 
@@ -329,15 +330,11 @@ func (ts *TestScript) setup() {
 	}
 	ts.envMap = make(map[string]string)
 	for _, kv := range ts.env {
-		if i := strings.Index(kv, "="); i >= 0 {
-			ts.envMap[kv[:i]] = kv[i+1:]
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			ts.envMap[k] = v
 		}
 	}
 
-	// Create work directory.
-	if err := os.MkdirAll(ts.workdir, 0755); err != nil {
-		ts.t.Fatal(err)
-	}
 	if err := os.MkdirAll(filepath.Join(ts.workdir, "tmp"), 0755); err != nil {
 		ts.t.Fatal(err)
 	}
@@ -378,7 +375,10 @@ func (ts *TestScript) run() {
 	if ar != nil {
 		for _, f := range ar.Files {
 			name := f.Name
-			ts.mkabs(filepath.Dir(name))
+			dir := filepath.Dir(ts.mkabs(name))
+			if err := os.MkdirAll(dir, 0777); err != nil {
+				ts.t.Fatal(err)
+			}
 			if err := os.WriteFile(ts.mkabs(name), f.Data, 0666); err != nil {
 				ts.t.Fatal(err)
 			}
@@ -561,8 +561,8 @@ func (ts *TestScript) mkabs(file string) string {
 func (ts *TestScript) refreshEnvMap() {
 	ts.envMap = make(map[string]string)
 	for _, kv := range ts.env {
-		if i := strings.Index(kv, "="); i >= 0 {
-			ts.envMap[kv[:i]] = kv[i+1:]
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			ts.envMap[k] = v
 		}
 	}
 }
@@ -639,7 +639,7 @@ func (ts *TestScript) cmdCD(neg bool, args []string) {
 		dir = filepath.Join(ts.cd, dir)
 	}
 	info, err := os.Stat(dir)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		ts.t.Fatalf("script:%d: directory %s does not exist", ts.lineno, dir)
 	}
 	if err != nil {
@@ -671,10 +671,20 @@ func (ts *TestScript) cmdEnv(neg bool, args []string) {
 		ts.t.Fatalf("script:%d: usage: env [key=value]", ts.lineno)
 	}
 	kv := args[1]
-	if i := strings.Index(kv, "="); i >= 0 {
-		key, value := kv[:i], kv[i+1:]
-		ts.env = append(ts.env, key+"="+value)
-		ts.envMap[key] = value
+	if k, v, ok := strings.Cut(kv, "="); ok {
+		entry := k + "=" + v
+		replaced := false
+		for i, existing := range ts.env {
+			if ek, _, eok := strings.Cut(existing, "="); eok && ek == k {
+				ts.env[i] = entry
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			ts.env = append(ts.env, entry)
+		}
+		ts.envMap[k] = v
 	} else {
 		ts.t.Fatalf("script:%d: env: no '=' in argument", ts.lineno)
 	}
@@ -684,8 +694,67 @@ func (ts *TestScript) cmdExecBuiltin(neg bool, args []string) {
 	if len(args) < 2 {
 		ts.t.Fatalf("script:%d: usage: exec program [args...]", ts.lineno)
 	}
-	// Implementation would execute external programs
-	ts.t.Fatalf("script:%d: exec command not fully implemented", ts.lineno)
+
+	var err error
+	if len(args) > 2 && backgroundSpecifier.MatchString(args[len(args)-1]) {
+		// Background execution
+		bgName := strings.TrimSuffix(strings.TrimPrefix(args[len(args)-1], "&"), "&")
+		if bgName == "" {
+			bgName = fmt.Sprintf("bg%d", len(ts.background))
+		}
+		if ts.findBackground(bgName) != nil {
+			ts.t.Fatalf("script:%d: duplicate background process name %q", ts.lineno, bgName)
+		}
+
+		cmd, execErr := ts.buildExecCmd(args[1], args[2:len(args)-1])
+		if execErr != nil {
+			err = execErr
+		} else {
+			bg := backgroundCmd{
+				name: bgName,
+				cmd:  cmd,
+				neg:  neg,
+			}
+			cmd.Stdout = &bg.stdout
+			cmd.Stderr = &bg.stderr
+			wait := make(chan struct{})
+			go func() {
+				ts.waitOrStop(context.Background(), cmd, -1)
+				close(wait)
+			}()
+			bg.wait = wait
+			ts.background = append(ts.background, bg)
+		}
+		ts.stdout, ts.stderr = "", ""
+	} else {
+		// Foreground execution
+		ts.stdout, ts.stderr, err = ts.exec(args[1], args[2:]...)
+		if ts.stdout != "" {
+			ts.t.Logf("[stdout]\n%s", ts.stdout)
+		}
+		if ts.stderr != "" {
+			ts.t.Logf("[stderr]\n%s", ts.stderr)
+		}
+	}
+
+	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			ts.t.Fatalf("script:%d: exec %s: %v", ts.lineno, args[1], err)
+			return
+		}
+		// Command exited non-zero
+		if !neg {
+			ts.t.Fatalf("script:%d: %s failed: %v\n%s", ts.lineno, args[1], err, ts.stderr)
+			return
+		}
+	} else {
+		// Command succeeded
+		if neg {
+			ts.t.Fatalf("script:%d: unexpected command success", ts.lineno)
+			return
+		}
+	}
 }
 
 func (ts *TestScript) cmdExists(neg bool, args []string) {
@@ -711,8 +780,23 @@ func (ts *TestScript) cmdGrep(neg bool, args []string) {
 	if len(args) != 3 {
 		ts.t.Fatalf("script:%d: usage: grep pattern file", ts.lineno)
 	}
-	// Implementation would search for patterns in files
-	ts.t.Fatalf("script:%d: grep command not fully implemented", ts.lineno)
+	pattern := args[1]
+	filename := ts.mkabs(args[2])
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		ts.t.Fatalf("script:%d: grep %s: %v", ts.lineno, filename, err)
+	}
+
+	content := string(data)
+	match := strings.Contains(content, pattern)
+	if match == neg {
+		if neg {
+			ts.t.Fatalf("script:%d: file %s unexpectedly contains %q", ts.lineno, filename, pattern)
+		} else {
+			ts.t.Fatalf("script:%d: file %s does not contain %q", ts.lineno, filename, pattern)
+		}
+	}
 }
 
 func (ts *TestScript) cmdMkdir(neg bool, args []string) {
@@ -733,7 +817,9 @@ func (ts *TestScript) cmdRm(neg bool, args []string) {
 	}
 	for _, arg := range args[1:] {
 		file := ts.mkabs(arg)
-		removeAll(file)
+		if err := removeAll(file); err != nil {
+			ts.t.Fatalf("script:%d: rm %s: %v", ts.lineno, file, err)
+		}
 	}
 }
 
@@ -749,16 +835,30 @@ func (ts *TestScript) cmdStderr(neg bool, args []string) {
 	if len(args) != 2 {
 		ts.t.Fatalf("script:%d: usage: stderr text", ts.lineno)
 	}
-	// Implementation would check stderr content
-	ts.t.Fatalf("script:%d: stderr command not fully implemented", ts.lineno)
+	pattern := args[1]
+	match := strings.Contains(ts.stderr, pattern)
+	if match == neg {
+		if neg {
+			ts.t.Fatalf("script:%d: stderr unexpectedly contains %q", ts.lineno, pattern)
+		} else {
+			ts.t.Fatalf("script:%d: stderr does not contain %q", ts.lineno, pattern)
+		}
+	}
 }
 
 func (ts *TestScript) cmdStdout(neg bool, args []string) {
 	if len(args) != 2 {
 		ts.t.Fatalf("script:%d: usage: stdout text", ts.lineno)
 	}
-	// Implementation would check stdout content
-	ts.t.Fatalf("script:%d: stdout command not fully implemented", ts.lineno)
+	pattern := args[1]
+	match := strings.Contains(ts.stdout, pattern)
+	if match == neg {
+		if neg {
+			ts.t.Fatalf("script:%d: stdout unexpectedly contains %q", ts.lineno, pattern)
+		} else {
+			ts.t.Fatalf("script:%d: stdout does not contain %q", ts.lineno, pattern)
+		}
+	}
 }
 
 func (ts *TestScript) cmdStop(neg bool, args []string) {
@@ -766,8 +866,65 @@ func (ts *TestScript) cmdStop(neg bool, args []string) {
 }
 
 func (ts *TestScript) cmdWait(neg bool, args []string) {
-	// Implementation would wait for background commands
-	ts.t.Fatalf("script:%d: wait command not fully implemented", ts.lineno)
+	var bgcmds []*backgroundCmd
+	if len(args) == 1 {
+		// Wait for all background commands
+		bgcmds = make([]*backgroundCmd, len(ts.background))
+		for i := range ts.background {
+			bgcmds[i] = &ts.background[i]
+		}
+	} else {
+		// Wait for specific background commands
+		for _, name := range args[1:] {
+			bg := ts.findBackground(name)
+			if bg == nil {
+				ts.t.Fatalf("script:%d: unknown background process %q", ts.lineno, name)
+			}
+			bgcmds = append(bgcmds, bg)
+		}
+	}
+
+	var stdouts, stderrs []string
+	for _, bg := range bgcmds {
+		<-bg.wait
+
+		// Collect output
+		if bg.stdout.Len() > 0 {
+			stdouts = append(stdouts, bg.stdout.String())
+		}
+		if bg.stderr.Len() > 0 {
+			stderrs = append(stderrs, bg.stderr.String())
+		}
+
+		// Check exit status
+		var err error
+		if bg.cmd.ProcessState != nil && !bg.cmd.ProcessState.Success() {
+			err = &exec.ExitError{ProcessState: bg.cmd.ProcessState}
+		}
+
+		success := err == nil
+		if success != !bg.neg {
+			if bg.neg {
+				ts.t.Fatalf("script:%d: unexpected command success", ts.lineno)
+			} else {
+				ts.t.Fatalf("script:%d: unexpected command failure", ts.lineno)
+			}
+		}
+	}
+
+	// Update stdout/stderr with combined output
+	ts.stdout = strings.Join(stdouts, "")
+	ts.stderr = strings.Join(stderrs, "")
+
+	// Remove completed background commands
+	if len(args) == 1 {
+		ts.background = nil
+	} else {
+		// Remove specific commands
+		for _, name := range args[1:] {
+			ts.removeBackground(name)
+		}
+	}
 }
 
 // Utility functions
@@ -795,5 +952,103 @@ func tempEnvName() string {
 		return "TMPDIR" // actually plan 9 doesn't have one at all but this is fine
 	default:
 		return "TMPDIR"
+	}
+}
+
+// exec executes a command and returns stdout, stderr, and any error
+func (ts *TestScript) exec(name string, args ...string) (stdout, stderr string, err error) {
+	cmd, err := ts.buildExecCmd(name, args)
+	if err != nil {
+		return "", "", err
+	}
+
+	var stdoutBuf, stderrBuf strings.Builder
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err = cmd.Run()
+	return stdoutBuf.String(), stderrBuf.String(), err
+}
+
+// buildExecCmd creates an exec.Cmd for the given command and arguments
+func (ts *TestScript) buildExecCmd(name string, args []string) (*exec.Cmd, error) {
+	var cmd *exec.Cmd
+
+	// If name contains path separators, use it as is
+	if strings.ContainsRune(name, filepath.Separator) || strings.ContainsRune(name, '/') {
+		cmd = exec.Command(name, args...)
+	} else {
+		// Look for the command in PATH
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return nil, fmt.Errorf("command %q not found: %v", name, err)
+		}
+		cmd = exec.Command(path, args...)
+	}
+
+	cmd.Dir = ts.cd
+	cmd.Env = append(ts.env, "PWD="+ts.cd)
+
+	return cmd, nil
+}
+
+// waitOrStop waits for a command to complete or stops it after timeout
+func (ts *TestScript) waitOrStop(ctx context.Context, cmd *exec.Cmd, interrupt time.Duration) error {
+	if cmd.Process == nil {
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	if interrupt < 0 {
+		// No timeout, just wait
+		return <-done
+	}
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// Context cancelled, try to stop the process
+		if cmd.Process != nil {
+			if runtime.GOOS == "windows" {
+				cmd.Process.Kill()
+			} else {
+				cmd.Process.Signal(os.Interrupt)
+				// Give it time to stop gracefully
+				select {
+				case <-done:
+					return nil
+				case <-time.After(interrupt):
+					cmd.Process.Kill()
+				}
+			}
+		}
+		return ctx.Err()
+	}
+}
+
+// findBackground finds a background command by name
+func (ts *TestScript) findBackground(name string) *backgroundCmd {
+	for i := range ts.background {
+		if ts.background[i].name == name {
+			return &ts.background[i]
+		}
+	}
+	return nil
+}
+
+// removeBackground removes a background command by name
+func (ts *TestScript) removeBackground(name string) {
+	for i := range ts.background {
+		if ts.background[i].name == name {
+			ts.background = slices.Delete(ts.background, i, i+1)
+			return
+		}
 	}
 }

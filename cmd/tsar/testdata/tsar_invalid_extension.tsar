@@ -1,0 +1,4 @@
+! tsar $WORK/invalid.txt
+
+-- invalid.txt --
+This is not a valid .tsar file

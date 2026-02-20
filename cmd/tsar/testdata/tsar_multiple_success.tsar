@@ -1,0 +1,15 @@
+tsar $WORK/test1.tsar
+tsar $WORK/test2.tsar  
+tsar $WORK/test3.tsar
+
+-- test1.tsar --
+mkdir dir1
+exists dir1
+
+-- test2.tsar --
+mkdir dir2
+exists dir2
+
+-- test3.tsar --
+mkdir dir3
+exists dir3

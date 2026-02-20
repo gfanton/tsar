@@ -1,0 +1,10 @@
+! tsar $WORK/failing_test.tsar
+! tsar $WORK/invalid.txt  
+! tsar $WORK/nonexistent.tsar
+
+-- failing_test.tsar --
+# This test should fail
+exists nonexistent_file.txt
+
+-- invalid.txt --
+This is not a valid .tsar file

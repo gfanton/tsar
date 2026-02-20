@@ -4,14 +4,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gfanton/testscript"
+	"github.com/gfanton/tstar"
 )
 
 // TestBasic demonstrates basic usage of testscript with custom commands
 func TestBasic(t *testing.T) {
-	testscript.Run(t, testscript.Params{
+	tstar.Run(t, tstar.Params{
 		Dir: "testdata",
-		Commands: map[string]func(*testscript.TestScript, bool, []string){
+		Commands: map[string]func(*tstar.TestScript, bool, []string){
 			"echo": cmdEcho,
 			"cat":  cmdCat,
 		},
@@ -19,7 +19,7 @@ func TestBasic(t *testing.T) {
 }
 
 // cmdEcho implements a simple echo command
-func cmdEcho(ts *testscript.TestScript, neg bool, args []string) {
+func cmdEcho(ts *tstar.TestScript, neg bool, args []string) {
 	if len(args) < 2 {
 		ts.Fatalf("usage: echo text...")
 	}
@@ -29,7 +29,7 @@ func cmdEcho(ts *testscript.TestScript, neg bool, args []string) {
 }
 
 // cmdCat implements a simple cat command
-func cmdCat(ts *testscript.TestScript, neg bool, args []string) {
+func cmdCat(ts *tstar.TestScript, neg bool, args []string) {
 	if len(args) != 2 {
 		ts.Fatalf("usage: cat file")
 	}

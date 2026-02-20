@@ -1,0 +1,18 @@
+# Test tsar command flags and options
+# This test verifies various tsar command-line flags work correctly
+
+tsar $WORK/env_test.tsar
+tsar -v $WORK/verbose_test.tsar
+tsar --test-work $WORK/work_test.tsar
+
+-- env_test.tsar --
+mkdir hello
+exists hello
+
+-- verbose_test.tsar --
+mkdir verbose_dir
+exists verbose_dir
+
+-- work_test.tsar --
+mkdir work_dir  
+exists work_dir

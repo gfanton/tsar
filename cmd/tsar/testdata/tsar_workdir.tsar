@@ -1,0 +1,5 @@
+tsar --workdir-root $WORK/custom_workdir $WORK/simple_test.tsar
+
+-- simple_test.tsar --
+mkdir test_file
+exists test_file
