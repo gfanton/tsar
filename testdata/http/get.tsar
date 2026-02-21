@@ -1,0 +1,6 @@
+# Basic GET returns 200 with JSON body
+http GET $SERVER/api/info
+stdout status
+stdout healthy
+httpstatus 200
+httpheader Content-Type application/json

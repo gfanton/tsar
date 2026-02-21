@@ -1,0 +1,5 @@
+# Flaky server fails every 3rd request; -all runs all iterations
+! repeat -all 9 http GET $SERVER/flaky
+stderr "6/9 passed"
+stderr "3/9 failed"
+stderr "first at iteration 3"

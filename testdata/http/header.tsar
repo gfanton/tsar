@@ -1,0 +1,5 @@
+# httpheader checks against response headers
+http GET $SERVER/with-headers
+httpheader Content-Type application/json
+httpheader X-Request-Id abc-123
+! httpheader X-Missing anything

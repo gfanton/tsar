@@ -1,0 +1,3 @@
+# All iterations succeed (fail-fast mode)
+repeat 10 exec echo hello
+stderr "10/10 passed"

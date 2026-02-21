@@ -1,0 +1,4 @@
+# Non-success status with negation prefix
+! http GET $SERVER/missing
+stdout "not found"
+httpstatus 404

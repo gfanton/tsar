@@ -1,0 +1,13 @@
+# httpstatus checks across different status codes
+http GET $SERVER/health
+httpstatus 200
+
+http GET $SERVER/created
+httpstatus 201
+
+! http GET $SERVER/notfound
+httpstatus 404
+
+# Negated status check
+http GET $SERVER/health
+! httpstatus 404

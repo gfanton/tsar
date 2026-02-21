@@ -1,0 +1,3 @@
+# First iteration fails immediately (fail-fast mode)
+! repeat 3 exec false
+stderr "failed at iteration"

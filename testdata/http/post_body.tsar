@@ -1,0 +1,9 @@
+# POST with body file and Content-Type header
+http POST $SERVER/api/echo -body request.json -header "Content-Type: application/json"
+stdout name
+stdout test
+httpstatus 200
+httpheader Content-Type application/json
+
+-- request.json --
+{"name":"test"}

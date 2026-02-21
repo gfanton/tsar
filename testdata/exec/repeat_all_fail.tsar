@@ -1,0 +1,5 @@
+# All iterations fail; -all still runs every one
+! repeat -all 4 exec false
+stderr "0/4 passed"
+stderr "4/4 failed"
+stderr "first at iteration 1"

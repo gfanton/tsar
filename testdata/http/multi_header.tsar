@@ -1,0 +1,4 @@
+# Multiple request headers verified via echo endpoint
+http GET $SERVER/echo/headers -header "Authorization: Bearer mytoken" -header "Accept: text/plain"
+stdout "Authorization: Bearer mytoken"
+stdout "Accept: text/plain"
