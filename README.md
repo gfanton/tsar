@@ -1,182 +1,118 @@
-# testscript - Script-driven Testing Library
+# tsar - Script-driven Testing Library
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/gfanton/testscript.svg)](https://pkg.go.dev/github.com/gfanton/testscript)
+[![Go Reference](https://pkg.go.dev/badge/github.com/gfanton/tsar.svg)](https://pkg.go.dev/github.com/gfanton/tsar)
 
-`testscript` is a Go testing library for script-driven tests, heavily inspired by and adapted from the [testscript](https://pkg.go.dev/github.com/rogpeppe/go-internal/testscript) package originally developed by [Roger Peppe](https://github.com/rogpeppe). The library enables complex integration and system testing scenarios using `.tsar` files (testscript archive format).
-
-The command-line tool is named `tsar` (short for "testscript archive"), while the project and library retain the name `testscript` to honor the original package.
-
-## Features
-
-- **Script-based Testing**: Define tests using simple script files with `.tsar` extension
-- **Command-line Tool**: `tsar` command for running test scripts directly
-- **Isolated Environments**: Each test runs in a fresh temporary directory
-- **Custom Commands**: Register your own commands alongside built-in ones
-- **Conditional Execution**: Support for platform-specific and conditional test execution
-- **Archive Support**: Embed files directly in test scripts using txtar format
-- **Environment Variables**: Full support for environment variable configuration
-- **Extensible**: Easy to integrate with existing Go test suites
+`tsar` is a Go testing library for script-driven tests, inspired by the [testscript](https://pkg.go.dev/github.com/rogpeppe/go-internal/testscript) package by [Roger Peppe](https://github.com/rogpeppe). Define tests as `.tsar` scripts with built-in support for HTTP testing, repeat/stress testing, and custom commands.
 
 ## Installation
 
-### Library
 ```bash
-go get github.com/gfanton/testscript
-```
+# Library
+go get github.com/gfanton/tsar
 
-### Command-line Tool
-```bash
-go install github.com/gfanton/testscript/cmd/tsar@latest
+# Command-line tool
+go install github.com/gfanton/tsar/cmd/tsar@latest
 ```
 
 ## Quick Start
 
-### 1. Create a test script file
-
-Create a file `testdata/example.tsar`:
+Create `testdata/hello.tsar`:
 
 ```bash
-# Test basic file operations
-mkdir testdir
-cd testdir
-echo "Hello World" > hello.txt
-
-# Check that file exists and contains expected content
-exists hello.txt
-grep "Hello World" hello.txt
-
-# Test with embedded archive data
--- input.txt --
-This is test input data
-for the archive section
--- expected.txt --
-This is expected output
+exec echo "Hello, World!"
+stdout "Hello, World!"
 ```
 
-### 2. Write a Go test
+Write a Go test:
 
 ```go
-package mypackage
-
-import (
-    "testing"
-    "github.com/gfanton/testscript"
-)
-
-func TestMyCommand(t *testing.T) {
-    testscript.Run(t, testscript.Params{
-        Dir: "testdata",
-        Commands: map[string]func(*testscript.TestScript, bool, []string){
-            "mycommand": handleMyCommand,
-        },
-    })
-}
-
-func handleMyCommand(ts *testscript.TestScript, neg bool, args []string) {
-    // Your custom command implementation
-    if len(args) < 2 {
-        ts.Fatalf("usage: mycommand <arg>")
-    }
-    // ... implement your command logic
+func TestHello(t *testing.T) {
+    tsar.Run(t, tsar.Params{Dir: "testdata"})
 }
 ```
 
-### 3. Run the tests
+Each `.tsar` file in the directory becomes a subtest.
 
-Using Go test:
+## Built-in Commands
+
+### General
+
+| Command | Description |
+|---------|-------------|
+| `cd <dir>` | Change directory |
+| `env [key=value]` | Set or print environment variables |
+| `exec <cmd> [args...]` | Execute external command |
+| `exists <file>` | Assert file exists |
+| `grep <pattern> <file>` | Assert file contains pattern |
+| `mkdir <dir>...` | Create directories |
+| `cp <src> <dst>` | Copy file |
+| `rm <file>...` | Remove files/directories |
+| `skip [message]` | Skip the test |
+| `stop` | Stop test execution |
+| `wait [name...]` | Wait for background commands |
+
+### Output Assertions
+
+| Command | Description |
+|---------|-------------|
+| `stdout <pattern>` | Assert last command's stdout contains pattern |
+| `stderr <pattern>` | Assert last command's stderr contains pattern |
+
+### HTTP
+
+| Command | Description |
+|---------|-------------|
+| `http METHOD URL [-body FILE] [-header "K: V"]...` | Perform HTTP request |
+| `httpstatus CODE` | Assert last HTTP response status code |
+| `httpheader NAME VALUE` | Assert last HTTP response header contains value |
+
+The `http` command captures the response body in stdout, so you can chain `stdout` assertions:
+
 ```bash
-go test
+http GET $SERVER/api/info
+stdout healthy
+httpstatus 200
+httpheader Content-Type application/json
+
+http POST $SERVER/api/echo -body payload.json -header "Content-Type: application/json"
+stdout result
+
+! http GET $SERVER/missing
+httpstatus 404
+stdout "not found"
 ```
 
-Using the `tsar` command:
+### Repeat / Stress Testing
+
 ```bash
-tsar testdata/              # Run all .tsar files in directory
-tsar testdata/example.tsar  # Run specific file
-tsar --verbose testdata/    # Verbose output
+repeat [-all] COUNT exec <cmd> [args...]
+repeat [-all] COUNT http METHOD URL [flags...]
 ```
 
-## Usage
-
-### Command-line Tool: `tsar`
-
-The `tsar` command provides a standalone way to run test scripts without writing Go code:
+Runs a command COUNT times. Without `-all`, stops at first failure. With `-all`, runs all iterations and reports stats to stderr:
 
 ```bash
-# Run all .tsar files in a directory
-tsar testdata/
+repeat 100 http GET $SERVER/health
+stderr "100/100 passed"
 
-# Run a specific test file
-tsar testdata/mytest.tsar
-
-# Command-line flags
-tsar --verbose testdata/         # Enable verbose output
-tsar --short testdata/           # Run tests in short mode
-tsar --test-work testdata/       # Preserve work directories
-tsar --workdir-root /tmp testdata/  # Custom work directory root
-
-# Environment variables (with TSAR_ prefix)
-TSAR_VERBOSE=true tsar testdata/
-TSAR_TEST_WORK=true tsar testdata/
-TSAR_WORKDIR_ROOT=/tmp tsar testdata/
+! repeat -all 20 http GET $SERVER/flaky
+stderr "16/20 passed"
+stderr "4/20 failed"
+stderr "first at iteration 5"
 ```
 
-Available flags:
-- `-v, --verbose`: Enable verbose output
-- `-s, --short`: Run tests in short mode
-- `--test-work`: Preserve work directories after tests
-- `-w, --workdir-root`: Root directory for work directories
-- `-c, --continue-on-error`: Continue executing tests after an error
-- `-e, --require-explicit-exec`: Require explicit 'exec' for command execution
-- `-u, --require-unique-names`: Require unique test names
+## Negation
 
-### Basic API
+Prefix any command with `!` to expect failure:
 
-The main entry point is `testscript.Run()`:
-
-```go
-testscript.Run(t, testscript.Params{
-    Dir: "testdata",           // Directory containing .tsar files
-    Commands: customCommands,   // Your custom commands
-    TestWork: false,           // Keep work directories after tests
-    Setup: setupFunc,          // Optional setup function
-    Condition: conditionFunc,  // Custom condition evaluator
-})
+```bash
+! exec false
+! http GET $SERVER/missing
+! httpstatus 200
+! httpheader X-Missing value
 ```
 
-### Custom Commands
-
-Register custom commands by providing a map of command names to handler functions:
-
-```go
-commands := map[string]func(*testscript.TestScript, bool, []string){
-    "echo": func(ts *testscript.TestScript, neg bool, args []string) {
-        // Implementation for 'echo' command
-        if len(args) < 2 {
-            ts.Fatalf("usage: echo text...")
-        }
-        // Your echo implementation here
-    },
-}
-```
-
-### Built-in Commands
-
-The library provides several built-in commands:
-
-- `cd <dir>` - Change directory
-- `mkdir <dir>...` - Create directories
-- `rm <file>...` - Remove files/directories
-- `exists <file>` - Check if file exists
-- `env <key>=<value>` - Set environment variable
-- `exec <cmd> <args>...` - Execute external command
-- `grep <pattern> <file>` - Search for pattern in file
-- `skip [message]` - Skip the test
-- `stop` - Stop test execution
-- `wait` - Wait for background commands
-
-### Conditional Execution
-
-Use conditions to run commands only under certain circumstances:
+## Conditional Execution
 
 ```bash
 [!windows] mkdir unix-only-dir
@@ -184,137 +120,93 @@ Use conditions to run commands only under certain circumstances:
 [!short] exec long-running-command
 ```
 
-Built-in conditions:
-- `short` - Running with `go test -short`
-- `windows`, `darwin`, `linux` - Operating system
-- `!condition` - Negation of any condition
+Built-in conditions: `short`, `windows`, `darwin`, `linux`. Negate with `!`.
 
-### Archive Support
+## Embedded Files
 
-Embed files directly in your test scripts:
+Scripts can embed files using [txtar](https://pkg.go.dev/golang.org/x/tools/txtar) format:
 
 ```bash
-# Your test commands here
-mkdir testdata
+exec cat config.json
+stdout "hello"
 
--- testdata/input.txt --
-This content will be written to testdata/input.txt
-when the test runs.
-
--- testdata/config.json --
-{
-    "key": "value"
-}
+-- config.json --
+{"message":"hello"}
 ```
 
-### TestScript API
+## Background Execution
 
-Within custom commands, you have access to the `TestScript` context:
+```bash
+exec slow-server &srv
+exec curl http://localhost:8080
+wait srv
+```
+
+## HTTP Testing with Servers
+
+Use `Params.Setup` to inject a test server URL:
 
 ```go
-func myCommand(ts *testscript.TestScript, neg bool, args []string) {
-    // File operations
-    content := ts.ReadFile("somefile.txt")
-    
-    // Environment
-    workDir := ts.Getenv("WORK")
-    ts.Setenv("MYVAR", "value")
-    
-    // Directory operations
-    ts.Chdir("subdir")
-    
-    // Logging and errors
-    ts.Logf("Processing %d items", len(args))
-    if someError {
-        ts.Fatalf("command failed: %v", err)
-    }
-    
-    // Execute external commands
-    if err := ts.Exec("go", "version"); err != nil {
-        ts.Fatalf("go command failed: %v", err)
-    }
+func TestAPI(t *testing.T) {
+    srv := httptest.NewServer(http.HandlerFunc(myHandler))
+    defer srv.Close()
+
+    tsar.Run(t, tsar.Params{
+        Dir: "testdata/api",
+        Setup: func(env *tsar.Env) error {
+            env.Setenv("SERVER", srv.URL)
+            return nil
+        },
+    })
 }
 ```
 
-## Examples
+Then in `testdata/api/health.tsar`:
 
-See the [`examples/`](examples/) directory for complete working examples:
-
-- [Basic usage](examples/basic_test.go) - Simple custom commands
-- [Integration example](examples/testdata/) - Real-world test scenarios
-
-### Example: Using the `tsar` command
-
-Create a test file `hello.tsar`:
 ```bash
-# Create a simple Go program
-mkdir hello
-cd hello
-
--- go.mod --
-module hello
-
-go 1.21
-
--- main.go --
-package main
-
-import "fmt"
-
-func main() {
-    fmt.Println("Hello, World!")
-}
-
-# Test that files were created
-exists go.mod
-exists main.go
-
-# Run the program (if exec is enabled)
-[!short] exec go run main.go
-[!short] stdout 'Hello, World!'
+http GET $SERVER/health
+stdout ok
+httpstatus 200
 ```
 
-Run it with:
-```bash
-tsar hello.tsar          # Basic execution
-tsar -v hello.tsar       # Verbose output
-tsar --test-work hello.tsar  # Keep work directory for inspection
+## Custom Commands
+
+```go
+tsar.Run(t, tsar.Params{
+    Dir: "testdata",
+    Commands: map[string]func(*tsar.TestScript, bool, []string){
+        "mycommand": func(ts *tsar.TestScript, neg bool, args []string) {
+            ts.Logf("args: %v", args[1:])
+        },
+    },
+})
 ```
 
-## Integration Examples
+## Command-line Tool
 
-This library is designed to be used for integration testing where you need to:
+```bash
+tsar testdata/              # Run all .tsar files in directory
+tsar testdata/example.tsar  # Run specific file
+tsar -v testdata/           # Verbose output
+tsar --test-work testdata/  # Preserve work directories
+```
 
-- Test command-line tools with complex scenarios
-- Verify file system operations and outputs
-- Run tests in isolated, reproducible environments
-- Combine multiple commands and assertions in a single test
+| Flag | Description |
+|------|-------------|
+| `-v, --verbose` | Verbose output |
+| `-s, --short` | Short mode |
+| `--test-work` | Preserve work directories |
+| `-w, --workdir-root` | Custom work directory root |
+| `-c, --continue-on-error` | Continue after errors |
+| `-e, --require-explicit-exec` | Require explicit `exec` |
+| `-u, --require-unique-names` | Require unique test names |
 
-The `.tsar` format allows you to define both the test steps and any required test files in a single, readable script.
+Environment variables with `TSAR_` prefix are also supported (e.g., `TSAR_VERBOSE=true`).
 
 ## Attribution
 
-This library is heavily inspired by and adapted from the [testscript](https://pkg.go.dev/github.com/rogpeppe/go-internal/testscript) package:
-
-- **Original Author**: [Roger Peppe](https://github.com/rogpeppe) <rogpeppe@gmail.com>
-- **Original Package**: https://pkg.go.dev/github.com/rogpeppe/go-internal/testscript
-- **License**: Original testscript package license applies
-
-The core design patterns, API structure, and implementation approach have been preserved while adapting the functionality to work with `.tsar` files and custom command registration.
-
-## Dependencies
-
-- `golang.org/x/tools/txtar` - For parsing embedded archive sections in test scripts
+Inspired by and adapted from the [testscript](https://pkg.go.dev/github.com/rogpeppe/go-internal/testscript) package by Roger Peppe.
 
 ## License
 
-This project maintains compatibility with the original testscript package licensing. See the original package for license details.
-
-## Contributing
-
-Contributions are welcome! Please ensure that:
-
-1. New features maintain compatibility with the testscript API where applicable
-2. Tests are provided for new functionality
-3. Documentation is updated accordingly
-4. Proper attribution to original authors is maintained
+See the original testscript package for license details.
