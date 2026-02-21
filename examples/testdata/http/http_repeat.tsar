@@ -1,0 +1,7 @@
+# Stress test health endpoint (fail-fast)
+repeat 100 http GET $SERVER/health
+stderr "100/100 passed"
+
+# Stress test with -all runs every iteration and reports stats
+repeat -all 50 http GET $SERVER/api/info
+stderr "50/50 passed"

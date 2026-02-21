@@ -1,0 +1,29 @@
+# Test that global setup.sh runs before tests and teardown.sh after
+mkdir project
+
+# Create setup.sh that writes a marker file in the project dir
+exec cp $WORK/setup.sh project/setup.sh
+exec chmod 755 project/setup.sh
+
+# Create teardown.sh
+exec cp $WORK/teardown.sh project/teardown.sh
+exec chmod 755 project/teardown.sh
+
+# Create a test that verifies setup ran
+exec cp $WORK/test_setup.tsar project/test_setup.tsar
+
+# Run tsar on the project directory
+tsar $WORK/project
+
+# Verify teardown ran (it writes a marker in the project dir)
+exists project/teardown-ran.marker
+
+-- setup.sh --
+#!/bin/sh
+echo "setup-marker" > "$PWD/setup-ran.marker"
+-- teardown.sh --
+#!/bin/sh
+echo "teardown-marker" > "$PWD/teardown-ran.marker"
+-- test_setup.tsar --
+exec echo setup-test-passed
+stdout setup-test-passed

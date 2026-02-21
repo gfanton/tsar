@@ -1,0 +1,7 @@
+# Server fails every 5th request (configured in test).
+# Use repeat -all to run all iterations and collect stats.
+# The ! prefix expects at least one failure.
+! repeat -all 20 http GET $SERVER/
+stderr "16/20 passed"
+stderr "4/20 failed"
+stderr "first at iteration 5"

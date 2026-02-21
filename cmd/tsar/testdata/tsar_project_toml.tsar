@@ -1,0 +1,26 @@
+# Test that tsar.toml per-test hooks work
+mkdir project
+mkdir project/scripts
+
+# Create per-test setup script
+exec cp $WORK/before.sh project/scripts/before.sh
+exec chmod 755 project/scripts/before.sh
+
+# Create tsar.toml
+exec cp $WORK/tsar.toml project/tsar.toml
+
+# Create test script that verifies per-test setup ran
+exec cp $WORK/test_toml.tsar project/test_toml.tsar
+
+# Run tsar
+tsar $WORK/project
+
+-- before.sh --
+#!/bin/sh
+echo "before-each-marker" > "$WORK/before-marker"
+-- tsar.toml --
+[test]
+setup = "scripts/before.sh"
+-- test_toml.tsar --
+exists before-marker
+grep before-each-marker before-marker

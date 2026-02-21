@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gfanton/tstar"
+	"github.com/gfanton/tsar"
 	"github.com/peterbourgon/ff/v4"
 )
 
@@ -93,7 +93,7 @@ func execTestRunner(ctx context.Context, cfg *config, args []string) error {
 	}
 
 	// Create parameters for testscript
-	params := tstar.Params{
+	params := tsar.Params{
 		TestWork:            cfg.testWork,
 		WorkdirRoot:         cfg.workdirRoot,
 		ContinueOnError:     cfg.continueOnError,
@@ -106,35 +106,24 @@ func execTestRunner(ctx context.Context, cfg *config, args []string) error {
 		verbose: cfg.verbose,
 	}
 
+	absPath, err := filepath.Abs(target)
+	if err != nil {
+		return fmt.Errorf("cannot get absolute path for %s: %w", target, err)
+	}
+
 	if !info.IsDir() {
 		// Single file execution
 		if !strings.HasSuffix(target, ".tsar") {
 			return fmt.Errorf("file must have .tsar extension: %s", target)
 		}
 
-		absPath, err := filepath.Abs(target)
-		if err != nil {
-			return fmt.Errorf("cannot get absolute path for %s: %v", target, err)
-		}
-
 		params.Dir = filepath.Dir(absPath)
-		tstar.RunFilesStandalone(runner, params, absPath)
-	} else {
-		// Directory execution
-		absPath, err := filepath.Abs(target)
-		if err != nil {
-			return fmt.Errorf("cannot get absolute path for %s: %v", target, err)
-		}
-
-		params.Dir = absPath
-		tstar.RunStandalone(runner, params)
+		return tsar.RunFilesStandaloneWithProject(runner, params, absPath)
 	}
 
-	if runner.failed {
-		return fmt.Errorf("tests failed")
-	}
-
-	return nil
+	// Directory execution
+	params.Dir = absPath
+	return tsar.RunStandaloneWithProject(runner, params)
 }
 
 // testResultCapture implements TestingT to capture test results

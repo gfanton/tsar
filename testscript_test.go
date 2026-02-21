@@ -1,4 +1,4 @@
-package tstar
+package tsar
 
 import (
 	"fmt"

@@ -28,20 +28,23 @@
 // environment. The package provides built-in commands for file operations,
 // content checking, and process execution, while allowing users to register
 // their own custom commands.
-package tstar
+package tsar
 
 import (
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -106,6 +109,16 @@ type Params struct {
 	// If ContinueOnError is false (the default), any error stops execution
 	// of later tests.
 	ContinueOnError bool
+
+	// TestSetup is the path to a shell script to run before each test,
+	// after the Params.Setup callback. The script runs via /bin/sh in the
+	// test's work directory with the test's environment.
+	TestSetup string
+
+	// TestTeardown is the path to a shell script to run after each test,
+	// before finalize. Runs even on failure; errors are logged but don't
+	// change the test result.
+	TestTeardown string
 }
 
 // An Env holds the environment variables to use for a test script invocation.
@@ -139,21 +152,27 @@ func (e *Env) Setenv(key, value string) {
 
 // TestScript holds execution state for a single test script.
 type TestScript struct {
-	t          TestingT
-	testDir    string // directory holding the test script
-	workdir    string // temporary work directory ($WORK)
-	log        bytes.Buffer
-	mark       int    // offset of next log truncation
-	cd         string // current directory during test execution; initially $WORK
-	name       string // short name of test ("foo")
-	file       string // full path to test file
-	lineno     int    // line number currently being processed
-	line       string // line currently being processed (for error messages)
-	env        []string
-	envMap     map[string]string // memo of env var key → value mapping
-	stdout     string            // standard output from last 'exec' command
-	stderr     string            // standard error from last 'exec' command
-	stopped    bool              // test wants to stop early
+	t        TestingT
+	testDir  string // directory holding the test script
+	workdir  string // temporary work directory ($WORK)
+	log      bytes.Buffer
+	mark     int    // offset of next log truncation
+	cd       string // current directory during test execution; initially $WORK
+	name     string // short name of test ("foo")
+	file     string // full path to test file
+	lineno   int    // line number currently being processed
+	line     string // line currently being processed (for error messages)
+	env      []string
+	envMap   map[string]string // memo of env var key → value mapping
+	stdout   string            // standard output from last 'exec' command
+	stderr   string            // standard error from last 'exec' command
+	stopped  bool              // test wants to stop early
+	httpResp struct {
+		statusCode int
+		status     string
+		header     http.Header
+		body       string
+	}
 	start      time.Time
 	background []backgroundCmd // backgrounded 'exec' commands
 
@@ -241,7 +260,6 @@ func globTestFiles(t TestingT, dir string) []string {
 func runFiles(t *testing.T, p Params, filenames []string) {
 	tests := buildTestCases(t, p, filenames)
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			ts := &TestScript{
 				t:       t,
@@ -371,6 +389,22 @@ func (ts *TestScript) run() {
 		ts.refreshEnvMap()
 	}
 
+	// Run per-test setup script
+	if ts.params.TestSetup != "" {
+		if err := ts.runHookScript(ts.params.TestSetup); err != nil {
+			ts.t.Fatalf("test setup script failed: %v", err)
+		}
+	}
+
+	// Schedule per-test teardown script (runs even on failure)
+	if ts.params.TestTeardown != "" {
+		defer func() {
+			if err := ts.runHookScript(ts.params.TestTeardown); err != nil {
+				ts.t.Logf("warning: test teardown script failed: %v", err)
+			}
+		}()
+	}
+
 	// Extract archive files if present.
 	if ar != nil {
 		for _, f := range ar.Files {
@@ -481,19 +515,23 @@ func (ts *TestScript) finalize() {
 
 // Built-in commands
 var builtinCmds = map[string]func(*TestScript, bool, []string){
-	"cd":     (*TestScript).cmdCD,
-	"cp":     (*TestScript).cmdCp,
-	"env":    (*TestScript).cmdEnv,
-	"exec":   (*TestScript).cmdExecBuiltin,
-	"exists": (*TestScript).cmdExists,
-	"grep":   (*TestScript).cmdGrep,
-	"mkdir":  (*TestScript).cmdMkdir,
-	"rm":     (*TestScript).cmdRm,
-	"skip":   (*TestScript).cmdSkip,
-	"stderr": (*TestScript).cmdStderr,
-	"stdout": (*TestScript).cmdStdout,
-	"stop":   (*TestScript).cmdStop,
-	"wait":   (*TestScript).cmdWait,
+	"cd":         (*TestScript).cmdCD,
+	"cp":         (*TestScript).cmdCp,
+	"env":        (*TestScript).cmdEnv,
+	"exec":       (*TestScript).cmdExecBuiltin,
+	"exists":     (*TestScript).cmdExists,
+	"grep":       (*TestScript).cmdGrep,
+	"http":       (*TestScript).cmdHTTP,
+	"httpheader": (*TestScript).cmdHTTPHeader,
+	"httpstatus": (*TestScript).cmdHTTPStatus,
+	"mkdir":      (*TestScript).cmdMkdir,
+	"repeat":     (*TestScript).cmdRepeat,
+	"rm":         (*TestScript).cmdRm,
+	"skip":       (*TestScript).cmdSkip,
+	"stderr":     (*TestScript).cmdStderr,
+	"stdout":     (*TestScript).cmdStdout,
+	"stop":       (*TestScript).cmdStop,
+	"wait":       (*TestScript).cmdWait,
 }
 
 // Helper functions and remaining method implementations...
@@ -509,9 +547,54 @@ func getLine(s string) (line, rest string) {
 
 // parse parses a command line into words, handling quotes and environment variables.
 func (ts *TestScript) parse(line string) []string {
-	// Expand environment variables
 	expandedLine := ts.expandEnvVars(line)
-	return strings.Fields(expandedLine)
+	args, err := splitArgs(expandedLine)
+	if err != nil {
+		ts.t.Fatalf("script:%d: %v", ts.lineno, err)
+	}
+	return args
+}
+
+// splitArgs splits a line into arguments, respecting double-quoted strings.
+// Inside double quotes, backslash escapes are supported (\", \\).
+// Whitespace inside quotes is preserved exactly (no collapsing).
+func splitArgs(line string) ([]string, error) {
+	var args []string
+	var current strings.Builder
+	inQuote := false
+	escaped := false
+
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if escaped {
+			current.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if c == '\\' && inQuote {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote && (c == ' ' || c == '\t') {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+			continue
+		}
+		current.WriteByte(c)
+	}
+	if inQuote {
+		return nil, fmt.Errorf("unclosed quote")
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args, nil
 }
 
 // expandEnvVars expands environment variables in the form $VAR or ${VAR}
@@ -865,6 +948,303 @@ func (ts *TestScript) cmdStop(neg bool, args []string) {
 	ts.stopped = true
 }
 
+// ---- HTTP Commands
+
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+}
+
+var validHTTPMethods = map[string]bool{
+	"GET": true, "POST": true, "PUT": true, "DELETE": true,
+	"PATCH": true, "HEAD": true, "OPTIONS": true,
+}
+
+func (ts *TestScript) cmdHTTP(neg bool, args []string) {
+	if len(args) < 3 {
+		ts.t.Fatalf("script:%d: usage: http METHOD URL [-body FILE] [-header KEY:VALUE]...", ts.lineno)
+	}
+
+	method := args[1]
+	if !validHTTPMethods[method] {
+		ts.t.Fatalf("script:%d: http: invalid method %q", ts.lineno, method)
+	}
+	url := args[2]
+
+	statusCode, err := ts.doHTTP(method, url, args[3:])
+	if err != nil {
+		ts.t.Fatalf("script:%d: http %s %s: %v", ts.lineno, method, url, err)
+		return
+	}
+
+	ts.t.Logf("[http %d]\n%s", statusCode, ts.stdout)
+
+	if statusCode >= 200 && statusCode < 300 {
+		if neg {
+			ts.t.Fatalf("script:%d: http: unexpected success (status %d)", ts.lineno, statusCode)
+		}
+	} else {
+		if !neg {
+			ts.t.Fatalf("script:%d: http: non-success status %d", ts.lineno, statusCode)
+		}
+	}
+}
+
+// doHTTP performs the HTTP request and stores the response state.
+// Returns the status code and any network/setup error.
+func (ts *TestScript) doHTTP(method, url string, flags []string) (int, error) {
+	var bodyFile string
+	var headers []string
+
+	for i := 0; i < len(flags); i++ {
+		switch flags[i] {
+		case "-body":
+			i++
+			if i >= len(flags) {
+				return 0, fmt.Errorf("-body requires a filename argument")
+			}
+			bodyFile = flags[i]
+		case "-header":
+			i++
+			if i >= len(flags) {
+				return 0, fmt.Errorf("-header requires a KEY:VALUE argument")
+			}
+			headers = append(headers, flags[i])
+		default:
+			return 0, fmt.Errorf("unknown flag %q", flags[i])
+		}
+	}
+
+	var body io.Reader
+	if bodyFile != "" {
+		data, err := os.ReadFile(ts.mkabs(bodyFile))
+		if err != nil {
+			return 0, fmt.Errorf("read body file %q: %w", bodyFile, err)
+		}
+		body = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, h := range headers {
+		key, value, ok := strings.Cut(h, ":")
+		if !ok {
+			return 0, fmt.Errorf("invalid header %q (expected KEY:VALUE)", h)
+		}
+		req.Header.Set(strings.TrimSpace(key), strings.TrimSpace(value))
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("read response body: %w", err)
+	}
+
+	ts.httpResp.statusCode = resp.StatusCode
+	ts.httpResp.status = resp.Status
+	ts.httpResp.header = resp.Header
+	ts.httpResp.body = string(respBody)
+	ts.stdout = string(respBody)
+	ts.stderr = ""
+
+	return resp.StatusCode, nil
+}
+
+func (ts *TestScript) cmdHTTPStatus(neg bool, args []string) {
+	if len(args) != 2 {
+		ts.t.Fatalf("script:%d: usage: httpstatus CODE", ts.lineno)
+	}
+	if ts.httpResp.status == "" {
+		ts.t.Fatalf("script:%d: httpstatus: no HTTP response (run http first)", ts.lineno)
+	}
+
+	wantCode, err := strconv.Atoi(args[1])
+	if err != nil {
+		ts.t.Fatalf("script:%d: httpstatus: invalid code %q: %v", ts.lineno, args[1], err)
+	}
+
+	match := ts.httpResp.statusCode == wantCode
+	if match == neg {
+		if neg {
+			ts.t.Fatalf("script:%d: httpstatus: got %d, did not want %d", ts.lineno, ts.httpResp.statusCode, wantCode)
+		} else {
+			ts.t.Fatalf("script:%d: httpstatus: got %d, want %d", ts.lineno, ts.httpResp.statusCode, wantCode)
+		}
+	}
+}
+
+func (ts *TestScript) cmdHTTPHeader(neg bool, args []string) {
+	if len(args) != 3 {
+		ts.t.Fatalf("script:%d: usage: httpheader NAME VALUE", ts.lineno)
+	}
+	if ts.httpResp.status == "" {
+		ts.t.Fatalf("script:%d: httpheader: no HTTP response (run http first)", ts.lineno)
+	}
+
+	name := args[1]
+	want := args[2]
+	got := ts.httpResp.header.Get(name)
+	match := strings.Contains(got, want)
+	if match == neg {
+		if neg {
+			ts.t.Fatalf("script:%d: httpheader %s: value %q unexpectedly contains %q", ts.lineno, name, got, want)
+		} else {
+			ts.t.Fatalf("script:%d: httpheader %s: value %q does not contain %q", ts.lineno, name, got, want)
+		}
+	}
+}
+
+// ---- Repeat Command
+
+func (ts *TestScript) cmdRepeat(neg bool, args []string) {
+	if len(args) < 3 {
+		ts.t.Fatalf("script:%d: usage: repeat [-all] COUNT COMMAND...", ts.lineno)
+	}
+
+	// Parse flags before count
+	idx := 1
+	runAll := false
+	if args[idx] == "-all" {
+		runAll = true
+		idx++
+	}
+
+	if idx >= len(args) {
+		ts.t.Fatalf("script:%d: usage: repeat [-all] COUNT COMMAND...", ts.lineno)
+	}
+
+	count, err := strconv.Atoi(args[idx])
+	if err != nil || count <= 0 {
+		ts.t.Fatalf("script:%d: repeat: invalid count %q", ts.lineno, args[idx])
+	}
+	idx++
+
+	if idx >= len(args) {
+		ts.t.Fatalf("script:%d: usage: repeat [-all] COUNT COMMAND...", ts.lineno)
+	}
+
+	subcmd := args[idx]
+	subargs := args[idx+1:]
+
+	switch subcmd {
+	case "exec":
+		ts.repeatExec(neg, count, runAll, subargs)
+	case "http":
+		ts.repeatHTTP(neg, count, runAll, subargs)
+	default:
+		ts.t.Fatalf("script:%d: repeat only supports exec and http", ts.lineno)
+	}
+}
+
+func (ts *TestScript) repeatExec(neg bool, count int, runAll bool, args []string) {
+	if len(args) == 0 {
+		ts.t.Fatalf("script:%d: repeat exec: missing command", ts.lineno)
+	}
+
+	var passed, failed int
+	var firstFailIter int
+
+	for i := 1; i <= count; i++ {
+		stdout, stderr, err := ts.exec(args[0], args[1:]...)
+		if err != nil {
+			failed++
+			if firstFailIter == 0 {
+				firstFailIter = i
+				ts.t.Logf("[repeat iteration %d/%d FAIL]\n[stdout]\n%s[stderr]\n%s", i, count, stdout, stderr)
+			}
+
+			if !runAll {
+				ts.stdout = stdout
+				ts.stderr = fmt.Sprintf("repeat: failed at iteration %d/%d", i, count)
+				if !neg {
+					ts.t.Fatalf("script:%d: repeat exec: iteration %d/%d failed: %v", ts.lineno, i, count, err)
+				}
+				return
+			}
+			continue
+		}
+		passed++
+	}
+
+	ts.repeatFinish(neg, count, passed, failed, firstFailIter)
+}
+
+func (ts *TestScript) repeatHTTP(neg bool, count int, runAll bool, args []string) {
+	if len(args) < 2 {
+		ts.t.Fatalf("script:%d: repeat http: usage: repeat [-all] COUNT http METHOD URL [flags...]", ts.lineno)
+	}
+
+	method := args[0]
+	if !validHTTPMethods[method] {
+		ts.t.Fatalf("script:%d: repeat http: invalid method %q", ts.lineno, method)
+	}
+	url := args[1]
+	flags := args[2:]
+
+	var passed, failed int
+	var firstFailIter int
+
+	for i := 1; i <= count; i++ {
+		statusCode, err := ts.doHTTP(method, url, flags)
+		ok := err == nil && statusCode >= 200 && statusCode < 300
+
+		if !ok {
+			failed++
+			if firstFailIter == 0 {
+				firstFailIter = i
+				if err != nil {
+					ts.t.Logf("[repeat iteration %d/%d FAIL]\n  error: %v", i, count, err)
+				} else {
+					ts.t.Logf("[repeat iteration %d/%d FAIL]\n[http %d]\n%s", i, count, statusCode, ts.httpResp.body)
+				}
+			}
+
+			if !runAll {
+				ts.stderr = fmt.Sprintf("repeat: failed at iteration %d/%d", i, count)
+				if !neg {
+					if err != nil {
+						ts.t.Fatalf("script:%d: repeat http: iteration %d/%d: %v", ts.lineno, i, count, err)
+					} else {
+						ts.t.Fatalf("script:%d: repeat http: iteration %d/%d: status %d", ts.lineno, i, count, statusCode)
+					}
+				}
+				return
+			}
+			continue
+		}
+		passed++
+	}
+
+	ts.repeatFinish(neg, count, passed, failed, firstFailIter)
+}
+
+// repeatFinish writes the summary to stderr and handles pass/fail logic
+// after all iterations have completed (used by both run-all and full-pass paths).
+func (ts *TestScript) repeatFinish(neg bool, count, passed, failed, firstFailIter int) {
+	ts.stdout = ""
+
+	if failed > 0 {
+		ts.stderr = fmt.Sprintf("repeat: %d/%d passed, %d/%d failed (first at iteration %d)",
+			passed, count, failed, count, firstFailIter)
+		if !neg {
+			ts.t.Fatalf("script:%d: repeat: %d/%d iterations failed", ts.lineno, failed, count)
+		}
+		return
+	}
+
+	ts.stderr = fmt.Sprintf("repeat: %d/%d passed", count, count)
+	if neg {
+		ts.t.Fatalf("script:%d: repeat: all %d iterations succeeded unexpectedly", ts.lineno, count)
+	}
+}
+
 func (ts *TestScript) cmdWait(neg bool, args []string) {
 	var bgcmds []*backgroundCmd
 	if len(args) == 1 {
@@ -978,8 +1358,8 @@ func (ts *TestScript) buildExecCmd(name string, args []string) (*exec.Cmd, error
 	if strings.ContainsRune(name, filepath.Separator) || strings.ContainsRune(name, '/') {
 		cmd = exec.Command(name, args...)
 	} else {
-		// Look for the command in PATH
-		path, err := exec.LookPath(name)
+		// Search the test environment's PATH, not the system PATH
+		path, err := ts.lookPath(name)
 		if err != nil {
 			return nil, fmt.Errorf("command %q not found: %v", name, err)
 		}
@@ -990,6 +1370,25 @@ func (ts *TestScript) buildExecCmd(name string, args []string) (*exec.Cmd, error
 	cmd.Env = append(ts.env, "PWD="+ts.cd)
 
 	return cmd, nil
+}
+
+// lookPath searches for an executable in the test environment's PATH.
+func (ts *TestScript) lookPath(name string) (string, error) {
+	pathEnv := ts.envMap["PATH"]
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if !info.IsDir() && info.Mode()&0111 != 0 {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("executable file not found in test PATH")
 }
 
 // waitOrStop waits for a command to complete or stops it after timeout
@@ -1031,6 +1430,18 @@ func (ts *TestScript) waitOrStop(ctx context.Context, cmd *exec.Cmd, interrupt t
 		}
 		return ctx.Err()
 	}
+}
+
+// runHookScript executes a shell script in the test's work directory with its environment.
+func (ts *TestScript) runHookScript(scriptPath string) error {
+	cmd := exec.Command("/bin/sh", scriptPath)
+	cmd.Dir = ts.workdir
+	cmd.Env = append(ts.env, "PWD="+ts.workdir)
+	output, err := cmd.CombinedOutput()
+	if len(output) > 0 {
+		ts.t.Logf("[hook %s]\n%s", filepath.Base(scriptPath), output)
+	}
+	return err
 }
 
 // findBackground finds a background command by name

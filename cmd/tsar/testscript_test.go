@@ -4,20 +4,20 @@ import (
 	"context"
 	"testing"
 
-	"github.com/gfanton/tstar"
+	"github.com/gfanton/tsar"
 )
 
 func TestTsar(t *testing.T) {
-	p := tstar.Params{
+	p := tsar.Params{
 		Dir: "testdata",
-		Setup: func(env *tstar.Env) error {
+		Setup: func(env *tsar.Env) error {
 			return nil
 		},
 	}
 
 	// Register the tsar command for testscripts
-	p.Commands = map[string]func(*tstar.TestScript, bool, []string){}
-	p.Commands["tsar"] = func(ts *tstar.TestScript, neg bool, args []string) {
+	p.Commands = map[string]func(*tsar.TestScript, bool, []string){}
+	p.Commands["tsar"] = func(ts *tsar.TestScript, neg bool, args []string) {
 		tsCmd := NewCommand()
 		err := tsCmd.ParseAndRun(context.Background(), args[1:])
 
@@ -30,5 +30,5 @@ func TestTsar(t *testing.T) {
 		}
 	}
 
-	tstar.Run(t, p)
+	tsar.Run(t, p)
 }

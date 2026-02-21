@@ -1,0 +1,20 @@
+# Test that project bin/ directory scripts are available as commands
+mkdir project
+mkdir project/bin
+
+# Create a .sh script in bin/ that should be available as "greet"
+exec cp $WORK/greet.sh project/bin/greet.sh
+exec chmod 755 project/bin/greet.sh
+
+# Create a test script that uses the greet command
+exec cp $WORK/test_bin.tsar project/test_bin.tsar
+
+# Run tsar on the project directory
+tsar $WORK/project
+
+-- greet.sh --
+#!/bin/sh
+echo "hello $1"
+-- test_bin.tsar --
+exec greet world
+stdout hello

@@ -1,0 +1,31 @@
+# Basic GET returns 200 with body
+http GET $SERVER/health
+stdout ok
+httpstatus 200
+
+# JSON endpoint with header checks
+http GET $SERVER/api/info
+stdout healthy
+stdout version
+httpstatus 200
+httpheader Content-Type application/json
+httpheader X-Version 1.0.0
+
+# POST with body file and inline header
+http POST $SERVER/api/echo -body payload.json -header "Content-Type: application/json"
+stdout hello
+httpstatus 200
+httpheader Content-Type application/json
+
+# 404 with negation
+! http GET $SERVER/not-found
+stdout "not found"
+httpstatus 404
+
+# Negated httpstatus checks
+http GET $SERVER/health
+! httpstatus 404
+! httpstatus 500
+
+-- payload.json --
+{"message":"hello"}
