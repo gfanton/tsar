@@ -555,13 +555,15 @@ func (ts *TestScript) parse(line string) []string {
 	return args
 }
 
-// splitArgs splits a line into arguments, respecting double-quoted strings.
-// Inside double quotes, backslash escapes are supported (\", \\).
+// splitArgs splits a line into arguments, respecting quoted strings.
+// Double quotes support backslash escapes (\", \\).
+// Single quotes are literal (no escape processing).
 // Whitespace inside quotes is preserved exactly (no collapsing).
 func splitArgs(line string) ([]string, error) {
 	var args []string
 	var current strings.Builder
-	inQuote := false
+	inDouble := false
+	inSingle := false
 	escaped := false
 
 	for i := 0; i < len(line); i++ {
@@ -571,15 +573,27 @@ func splitArgs(line string) ([]string, error) {
 			escaped = false
 			continue
 		}
-		if c == '\\' && inQuote {
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			} else {
+				current.WriteByte(c)
+			}
+			continue
+		}
+		if c == '\\' && inDouble {
 			escaped = true
 			continue
 		}
 		if c == '"' {
-			inQuote = !inQuote
+			inDouble = !inDouble
 			continue
 		}
-		if !inQuote && (c == ' ' || c == '\t') {
+		if c == '\'' && !inDouble {
+			inSingle = true
+			continue
+		}
+		if !inDouble && (c == ' ' || c == '\t') {
 			if current.Len() > 0 {
 				args = append(args, current.String())
 				current.Reset()
@@ -588,7 +602,7 @@ func splitArgs(line string) ([]string, error) {
 		}
 		current.WriteByte(c)
 	}
-	if inQuote {
+	if inDouble || inSingle {
 		return nil, fmt.Errorf("unclosed quote")
 	}
 	if current.Len() > 0 {
@@ -703,6 +717,21 @@ func (ts *TestScript) Exec(name string, args ...string) error {
 		return errors.New("exec failed")
 	}
 	return nil
+}
+
+// MkAbs returns an absolute path for file relative to the test work directory.
+func (ts *TestScript) MkAbs(file string) string {
+	return ts.mkabs(file)
+}
+
+// SetStdout sets the stdout result for the current command.
+func (ts *TestScript) SetStdout(s string) {
+	ts.stdout = s
+}
+
+// SetStderr sets the stderr result for the current command.
+func (ts *TestScript) SetStderr(s string) {
+	ts.stderr = s
 }
 
 // Built-in command implementations
@@ -872,12 +901,16 @@ func (ts *TestScript) cmdGrep(neg bool, args []string) {
 	}
 
 	content := string(data)
-	match := strings.Contains(content, pattern)
+	re, err2 := regexp.Compile(pattern)
+	if err2 != nil {
+		ts.t.Fatalf("script:%d: grep: invalid pattern %q: %v", ts.lineno, pattern, err2)
+	}
+	match := re.MatchString(content)
 	if match == neg {
 		if neg {
-			ts.t.Fatalf("script:%d: file %s unexpectedly contains %q", ts.lineno, filename, pattern)
+			ts.t.Fatalf("script:%d: file %s unexpectedly matches %q", ts.lineno, filename, pattern)
 		} else {
-			ts.t.Fatalf("script:%d: file %s does not contain %q", ts.lineno, filename, pattern)
+			ts.t.Fatalf("script:%d: file %s does not match %q", ts.lineno, filename, pattern)
 		}
 	}
 }
@@ -919,12 +952,16 @@ func (ts *TestScript) cmdStderr(neg bool, args []string) {
 		ts.t.Fatalf("script:%d: usage: stderr text", ts.lineno)
 	}
 	pattern := args[1]
-	match := strings.Contains(ts.stderr, pattern)
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		ts.t.Fatalf("script:%d: stderr: invalid pattern %q: %v", ts.lineno, pattern, err)
+	}
+	match := re.MatchString(ts.stderr)
 	if match == neg {
 		if neg {
-			ts.t.Fatalf("script:%d: stderr unexpectedly contains %q", ts.lineno, pattern)
+			ts.t.Fatalf("script:%d: stderr unexpectedly matches %q", ts.lineno, pattern)
 		} else {
-			ts.t.Fatalf("script:%d: stderr does not contain %q", ts.lineno, pattern)
+			ts.t.Fatalf("script:%d: stderr does not match %q\nstderr: %s", ts.lineno, pattern, ts.stderr)
 		}
 	}
 }
@@ -934,12 +971,16 @@ func (ts *TestScript) cmdStdout(neg bool, args []string) {
 		ts.t.Fatalf("script:%d: usage: stdout text", ts.lineno)
 	}
 	pattern := args[1]
-	match := strings.Contains(ts.stdout, pattern)
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		ts.t.Fatalf("script:%d: stdout: invalid pattern %q: %v", ts.lineno, pattern, err)
+	}
+	match := re.MatchString(ts.stdout)
 	if match == neg {
 		if neg {
-			ts.t.Fatalf("script:%d: stdout unexpectedly contains %q", ts.lineno, pattern)
+			ts.t.Fatalf("script:%d: stdout unexpectedly matches %q", ts.lineno, pattern)
 		} else {
-			ts.t.Fatalf("script:%d: stdout does not contain %q", ts.lineno, pattern)
+			ts.t.Fatalf("script:%d: stdout does not match %q\nstdout: %s", ts.lineno, pattern, ts.stdout)
 		}
 	}
 }
