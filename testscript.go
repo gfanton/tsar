@@ -176,6 +176,8 @@ type TestScript struct {
 	start      time.Time
 	background []backgroundCmd // backgrounded 'exec' commands
 
+	logfiles []string // files registered via logfile command; dumped on failure
+
 	builtin map[string]func(*TestScript, bool, []string)
 	user    map[string]func(*TestScript, bool, []string) // external test commands; see Params.Commands
 	params  Params                                       // original parameters
@@ -318,6 +320,7 @@ func (ts *TestScript) setup() {
 	ts.stopped = false
 	ts.start = startTime
 	ts.background = nil
+	ts.logfiles = nil
 
 	root := os.TempDir()
 	if ts.params.WorkdirRoot != "" {
@@ -506,10 +509,30 @@ func (ts *TestScript) cmdExec(neg bool, args []string) {
 
 // finalize cleans up after script execution.
 func (ts *TestScript) finalize() {
+	if ts.t.Failed() {
+		ts.dumpLogfiles()
+	}
 	if !ts.params.TestWork {
 		removeAll(ts.workdir)
 	} else {
 		ts.t.Logf("work directory: %s", ts.workdir)
+	}
+}
+
+// dumpLogfiles writes the contents of registered logfiles to test output.
+func (ts *TestScript) dumpLogfiles() {
+	for _, path := range ts.logfiles {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // file may not exist yet
+		}
+		if len(data) > 0 {
+			name := path
+			if rel, err := filepath.Rel(ts.workdir, path); err == nil {
+				name = rel
+			}
+			ts.t.Logf("[logfile %s]\n%s", name, data)
+		}
 	}
 }
 
@@ -518,12 +541,14 @@ var builtinCmds = map[string]func(*TestScript, bool, []string){
 	"cd":         (*TestScript).cmdCD,
 	"cp":         (*TestScript).cmdCp,
 	"env":        (*TestScript).cmdEnv,
+	"envfile":    (*TestScript).cmdEnvfile,
 	"exec":       (*TestScript).cmdExecBuiltin,
 	"exists":     (*TestScript).cmdExists,
 	"grep":       (*TestScript).cmdGrep,
 	"http":       (*TestScript).cmdHTTP,
 	"httpheader": (*TestScript).cmdHTTPHeader,
 	"httpstatus": (*TestScript).cmdHTTPStatus,
+	"logfile":    (*TestScript).cmdLogfile,
 	"mkdir":      (*TestScript).cmdMkdir,
 	"repeat":     (*TestScript).cmdRepeat,
 	"rm":         (*TestScript).cmdRm,
@@ -800,6 +825,45 @@ func (ts *TestScript) cmdEnv(neg bool, args []string) {
 	} else {
 		ts.t.Fatalf("script:%d: env: no '=' in argument", ts.lineno)
 	}
+}
+
+// cmdEnvfile loads environment variables from a key=value file.
+// Blank lines and lines starting with # are skipped.
+// Values are set literally — environment variables in values are not expanded.
+func (ts *TestScript) cmdEnvfile(neg bool, args []string) {
+	if neg {
+		ts.t.Fatalf("script:%d: envfile does not support negation", ts.lineno)
+	}
+	if len(args) != 2 {
+		ts.t.Fatalf("script:%d: usage: envfile <file>", ts.lineno)
+	}
+	path := ts.mkabs(args[1])
+	data, err := os.ReadFile(path)
+	if err != nil {
+		ts.t.Fatalf("script:%d: envfile: %v", ts.lineno, err)
+	}
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			ts.t.Fatalf("script:%d: envfile %s:%d: invalid line (no '='): %q", ts.lineno, filepath.Base(path), i+1, line)
+		}
+		ts.Setenv(k, v)
+	}
+}
+
+// cmdLogfile registers a file to dump on test failure.
+func (ts *TestScript) cmdLogfile(neg bool, args []string) {
+	if neg {
+		ts.t.Fatalf("script:%d: logfile does not support negation", ts.lineno)
+	}
+	if len(args) != 2 {
+		ts.t.Fatalf("script:%d: usage: logfile <file>", ts.lineno)
+	}
+	ts.logfiles = append(ts.logfiles, ts.mkabs(args[1]))
 }
 
 func (ts *TestScript) cmdExecBuiltin(neg bool, args []string) {

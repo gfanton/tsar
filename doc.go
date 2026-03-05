@@ -39,9 +39,11 @@ The following built-in commands are available:
 	cd <dir>                                Change directory
 	cp <src> <dst>                          Copy file
 	env [key=value]                         Set/print environment variables
+	envfile <file>                          Load key=value pairs from file into env
 	exec <cmd> [args...]                    Execute external command
 	exists <file>                           Check that file exists
 	grep <pattern> <file>                   Check that file contains pattern
+	logfile <file>                          Register file to dump on test failure
 	mkdir <dir>...                          Create directories
 	rm <file>...                            Remove files/directories
 	skip [message]                          Skip the test

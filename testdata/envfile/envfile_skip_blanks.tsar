@@ -1,0 +1,10 @@
+# envfile skips blank lines and comments.
+envfile config.env
+exec sh -c 'echo $KEY'
+stdout value
+
+-- config.env --
+
+# this is a comment
+KEY=value
+

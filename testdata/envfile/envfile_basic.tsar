@@ -1,0 +1,11 @@
+# Load environment variables from a file.
+envfile config.env
+exec sh -c 'echo $FOO'
+stdout bar
+
+exec sh -c 'echo $BAZ'
+stdout qux
+
+-- config.env --
+FOO=bar
+BAZ=qux

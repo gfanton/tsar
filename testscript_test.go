@@ -176,6 +176,30 @@ func TestExec(t *testing.T) {
 	Run(t, Params{Dir: "testdata/exec"})
 }
 
+func TestEnvfile(t *testing.T) {
+	Run(t, Params{Dir: "testdata/envfile"})
+}
+
+func TestLogfile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a .tsar script that registers a logfile then fails.
+	// The logfile contents should appear in test output.
+	tsarContent := "logfile app.log\n! exec false\n"
+	writeFile(t, filepath.Join(dir, "test_logfile.tsar"), []byte(tsarContent), 0644)
+
+	// Write the log file content that should be dumped on failure.
+	// We can't pre-create it in WORK since WORK is created at runtime,
+	// so we use a setup hook to create it.
+	Run(t, Params{
+		Dir: dir,
+		Setup: func(env *Env) error {
+			logContent := "server started on :8080\nrequest handled\n"
+			return os.WriteFile(filepath.Join(env.WorkDir, "app.log"), []byte(logContent), 0644)
+		},
+	})
+}
+
 func TestHTTP(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(testHTTPHandler))
 	defer srv.Close()
