@@ -54,11 +54,16 @@ The following built-in commands are available:
 
 # HTTP Commands
 
-	http METHOD URL [-body FILE] [-header "Key: Value"]...
+	http METHOD URL [-body FILE] [-upload FIELD=FILE]... [-header "Key: Value"]...
 
 Performs an HTTP request. The response body is captured in stdout for
 assertion with the stdout command. Non-2xx status codes are treated as
 failure (use ! prefix to expect non-success).
+
+The -upload flag creates a multipart/form-data request with the specified file
+attached under the given form field name. The file path is relative to the
+test's work directory. Multiple -upload flags can be used. Cannot be combined
+with -body.
 
 	httpstatus CODE                         Assert last HTTP response status code
 	httpheader NAME VALUE                   Assert last HTTP response header contains value
@@ -75,6 +80,9 @@ Example:
 
 	! http GET $SERVER/missing
 	httpstatus 404
+
+	http POST $SERVER/upload -upload file=photo.jpg
+	httpstatus 200
 
 # Repeat Command
 

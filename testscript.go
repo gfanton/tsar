@@ -37,7 +37,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"mime/multipart"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,6 +48,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,6 +182,8 @@ type TestScript struct {
 
 	logfiles []string // files registered via logfile command; dumped on failure
 
+	httpClient *http.Client // per-test HTTP client with cookie jar
+
 	builtin map[string]func(*TestScript, bool, []string)
 	user    map[string]func(*TestScript, bool, []string) // external test commands; see Params.Commands
 	params  Params                                       // original parameters
@@ -264,14 +270,15 @@ func runFiles(t *testing.T, p Params, filenames []string) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := &TestScript{
-				t:       t,
-				name:    tc.name,
-				file:    tc.file,
-				testDir: filepath.Dir(tc.file),
-				params:  p,
-				builtin: builtinCmds,
-				user:    p.Commands,
-				start:   time.Now(),
+				t:          t,
+				name:       tc.name,
+				file:       tc.file,
+				testDir:    filepath.Dir(tc.file),
+				params:     p,
+				builtin:    builtinCmds,
+				user:       p.Commands,
+				start:      time.Now(),
+				httpClient: newTestHTTPClient(),
 			}
 			defer ts.finalize()
 			ts.run()
@@ -285,14 +292,15 @@ func runFilesStandalone(t TestingT, p Params, filenames []string) {
 		func() {
 			t.Logf("=== RUN   %s", tc.name)
 			ts := &TestScript{
-				t:       t,
-				name:    tc.name,
-				file:    tc.file,
-				testDir: filepath.Dir(tc.file),
-				params:  p,
-				builtin: builtinCmds,
-				user:    p.Commands,
-				start:   time.Now(),
+				t:          t,
+				name:       tc.name,
+				file:       tc.file,
+				testDir:    filepath.Dir(tc.file),
+				params:     p,
+				builtin:    builtinCmds,
+				user:       p.Commands,
+				start:      time.Now(),
+				httpClient: newTestHTTPClient(),
 			}
 			defer ts.finalize()
 			ts.run()
@@ -868,7 +876,14 @@ func (ts *TestScript) cmdLogfile(neg bool, args []string) {
 
 func (ts *TestScript) cmdExecBuiltin(neg bool, args []string) {
 	if len(args) < 2 {
-		ts.t.Fatalf("script:%d: usage: exec program [args...]", ts.lineno)
+		ts.t.Fatalf("script:%d: usage: exec [-timeout duration] program [args...]", ts.lineno)
+	}
+
+	// Parse -timeout flag before command name.
+	timeout, args := ts.parseExecTimeout(args)
+
+	if len(args) < 2 {
+		ts.t.Fatalf("script:%d: usage: exec [-timeout duration] program [args...]", ts.lineno)
 	}
 
 	var err error
@@ -904,7 +919,7 @@ func (ts *TestScript) cmdExecBuiltin(neg bool, args []string) {
 		ts.stdout, ts.stderr = "", ""
 	} else {
 		// Foreground execution
-		ts.stdout, ts.stderr, err = ts.exec(args[1], args[2:]...)
+		ts.stdout, ts.stderr, err = ts.execWithTimeout(timeout, args[1], args[2:]...)
 		if ts.stdout != "" {
 			ts.t.Logf("[stdout]\n%s", ts.stdout)
 		}
@@ -914,12 +929,7 @@ func (ts *TestScript) cmdExecBuiltin(neg bool, args []string) {
 	}
 
 	if err != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			ts.t.Fatalf("script:%d: exec %s: %v", ts.lineno, args[1], err)
-			return
-		}
-		// Command exited non-zero
+		// Command failed (non-zero exit, timeout, etc.)
 		if !neg {
 			ts.t.Fatalf("script:%d: %s failed: %v\n%s", ts.lineno, args[1], err, ts.stderr)
 			return
@@ -1055,8 +1065,12 @@ func (ts *TestScript) cmdStop(neg bool, args []string) {
 
 // ---- HTTP Commands
 
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
+func newTestHTTPClient() *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Jar:     jar,
+	}
 }
 
 var validHTTPMethods = map[string]bool{
@@ -1066,16 +1080,51 @@ var validHTTPMethods = map[string]bool{
 
 func (ts *TestScript) cmdHTTP(neg bool, args []string) {
 	if len(args) < 3 {
-		ts.t.Fatalf("script:%d: usage: http METHOD URL [-body FILE] [-header KEY:VALUE]...", ts.lineno)
+		ts.t.Fatalf("script:%d: usage: http [-timeout duration] METHOD URL [-body FILE] [-upload FIELD=FILE]... [-header KEY:VALUE]...", ts.lineno)
 	}
 
-	method := args[1]
+	// Parse -timeout flag before method.
+	idx := 1
+	var timeout time.Duration
+	if args[idx] == "-timeout" {
+		if idx+1 >= len(args) {
+			ts.t.Fatalf("script:%d: http: -timeout requires a duration argument", ts.lineno)
+		}
+		var err error
+		timeout, err = time.ParseDuration(args[idx+1])
+		if err != nil {
+			ts.t.Fatalf("script:%d: http: invalid timeout %q: %v", ts.lineno, args[idx+1], err)
+		}
+		idx += 2
+	}
+
+	if idx+1 >= len(args) {
+		ts.t.Fatalf("script:%d: usage: http [-timeout duration] METHOD URL [-body FILE] [-upload FIELD=FILE]... [-header KEY:VALUE]...", ts.lineno)
+	}
+
+	method := args[idx]
 	if !validHTTPMethods[method] {
 		ts.t.Fatalf("script:%d: http: invalid method %q", ts.lineno, method)
 	}
-	url := args[2]
+	url := args[idx+1]
 
-	statusCode, err := ts.doHTTP(method, url, args[3:])
+	var statusCode int
+	var err error
+	if timeout > 0 {
+		done := make(chan struct{})
+		go func() {
+			statusCode, err = ts.doHTTP(method, url, args[idx+2:])
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			ts.t.Fatalf("script:%d: http %s %s: timeout after %v", ts.lineno, method, url, timeout)
+			return
+		}
+	} else {
+		statusCode, err = ts.doHTTP(method, url, args[idx+2:])
+	}
 	if err != nil {
 		ts.t.Fatalf("script:%d: http %s %s: %v", ts.lineno, method, url, err)
 		return
@@ -1099,6 +1148,7 @@ func (ts *TestScript) cmdHTTP(neg bool, args []string) {
 func (ts *TestScript) doHTTP(method, url string, flags []string) (int, error) {
 	var bodyFile string
 	var headers []string
+	var uploads []string
 
 	for i := 0; i < len(flags); i++ {
 		switch flags[i] {
@@ -1114,13 +1164,44 @@ func (ts *TestScript) doHTTP(method, url string, flags []string) (int, error) {
 				return 0, fmt.Errorf("-header requires a KEY:VALUE argument")
 			}
 			headers = append(headers, flags[i])
+		case "-upload":
+			i++
+			if i >= len(flags) {
+				return 0, fmt.Errorf("-upload requires FIELD=FILE argument")
+			}
+			uploads = append(uploads, flags[i])
 		default:
 			return 0, fmt.Errorf("unknown flag %q", flags[i])
 		}
 	}
 
 	var body io.Reader
-	if bodyFile != "" {
+	if len(uploads) > 0 {
+		if bodyFile != "" {
+			return 0, fmt.Errorf("-upload and -body are mutually exclusive")
+		}
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		for _, u := range uploads {
+			field, file, ok := strings.Cut(u, "=")
+			if !ok {
+				return 0, fmt.Errorf("-upload %q: expected FIELD=FILE", u)
+			}
+			absPath := ts.mkabs(file)
+			data, err := os.ReadFile(absPath)
+			if err != nil {
+				return 0, fmt.Errorf("-upload %s: %w", file, err)
+			}
+			fw, err := mw.CreateFormFile(field, filepath.Base(file))
+			if err != nil {
+				return 0, fmt.Errorf("-upload create form file: %w", err)
+			}
+			fw.Write(data)
+		}
+		mw.Close()
+		body = bytes.NewReader(buf.Bytes())
+		headers = append(headers, "Content-Type: "+mw.FormDataContentType())
+	} else if bodyFile != "" {
 		data, err := os.ReadFile(ts.mkabs(bodyFile))
 		if err != nil {
 			return 0, fmt.Errorf("read body file %q: %w", bodyFile, err)
@@ -1141,7 +1222,7 @@ func (ts *TestScript) doHTTP(method, url string, flags []string) (int, error) {
 		req.Header.Set(strings.TrimSpace(key), strings.TrimSpace(value))
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := ts.httpClient.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -1159,6 +1240,103 @@ func (ts *TestScript) doHTTP(method, url string, flags []string) (int, error) {
 	ts.stdout = string(respBody)
 	ts.stderr = ""
 
+	return resp.StatusCode, nil
+}
+
+// parseHTTPFlags parses -body, -header, and -upload flags, reading file content eagerly.
+// Returns body data (nil if no -body/-upload), headers, and any error.
+func (ts *TestScript) parseHTTPFlags(flags []string) (bodyData []byte, headers []string, err error) {
+	var bodyFile string
+	var uploads []string
+
+	for i := 0; i < len(flags); i++ {
+		switch flags[i] {
+		case "-body":
+			i++
+			if i >= len(flags) {
+				return nil, nil, fmt.Errorf("-body requires a filename argument")
+			}
+			bodyFile = flags[i]
+		case "-header":
+			i++
+			if i >= len(flags) {
+				return nil, nil, fmt.Errorf("-header requires a KEY:VALUE argument")
+			}
+			headers = append(headers, flags[i])
+		case "-upload":
+			i++
+			if i >= len(flags) {
+				return nil, nil, fmt.Errorf("-upload requires FIELD=FILE argument")
+			}
+			uploads = append(uploads, flags[i])
+		default:
+			return nil, nil, fmt.Errorf("unknown flag %q", flags[i])
+		}
+	}
+
+	if len(uploads) > 0 {
+		if bodyFile != "" {
+			return nil, nil, fmt.Errorf("-upload and -body are mutually exclusive")
+		}
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		for _, u := range uploads {
+			field, file, ok := strings.Cut(u, "=")
+			if !ok {
+				return nil, nil, fmt.Errorf("-upload %q: expected FIELD=FILE", u)
+			}
+			absPath := ts.mkabs(file)
+			data, readErr := os.ReadFile(absPath)
+			if readErr != nil {
+				return nil, nil, fmt.Errorf("-upload %s: %w", file, readErr)
+			}
+			fw, createErr := mw.CreateFormFile(field, filepath.Base(file))
+			if createErr != nil {
+				return nil, nil, fmt.Errorf("-upload create form file: %w", createErr)
+			}
+			fw.Write(data)
+		}
+		mw.Close()
+		bodyData = buf.Bytes()
+		headers = append(headers, "Content-Type: "+mw.FormDataContentType())
+	} else if bodyFile != "" {
+		bodyData, err = os.ReadFile(ts.mkabs(bodyFile))
+		if err != nil {
+			return nil, nil, fmt.Errorf("read body file %q: %w", bodyFile, err)
+		}
+	}
+
+	return bodyData, headers, nil
+}
+
+// doHTTPRaw performs an HTTP request without touching shared TestScript state.
+// Safe to call from multiple goroutines.
+func (ts *TestScript) doHTTPRaw(method, url string, bodyData []byte, headers []string) (int, error) {
+	var body io.Reader
+	if bodyData != nil {
+		body = bytes.NewReader(bodyData)
+	}
+
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, h := range headers {
+		key, value, ok := strings.Cut(h, ":")
+		if !ok {
+			return 0, fmt.Errorf("invalid header %q (expected KEY:VALUE)", h)
+		}
+		req.Header.Set(strings.TrimSpace(key), strings.TrimSpace(value))
+	}
+
+	resp, err := ts.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode, nil
 }
 
@@ -1210,19 +1388,47 @@ func (ts *TestScript) cmdHTTPHeader(neg bool, args []string) {
 
 func (ts *TestScript) cmdRepeat(neg bool, args []string) {
 	if len(args) < 3 {
-		ts.t.Fatalf("script:%d: usage: repeat [-all] COUNT COMMAND...", ts.lineno)
+		ts.t.Fatalf("script:%d: usage: repeat [-all] [-parallel N] [-timeout duration] COUNT COMMAND...", ts.lineno)
 	}
 
-	// Parse flags before count
+	// Parse flags before count.
 	idx := 1
 	runAll := false
-	if args[idx] == "-all" {
-		runAll = true
-		idx++
+	parallel := 1
+	var timeout time.Duration
+	for idx < len(args) {
+		switch args[idx] {
+		case "-all":
+			runAll = true
+			idx++
+		case "-timeout":
+			if idx+1 >= len(args) {
+				ts.t.Fatalf("script:%d: repeat: -timeout requires a duration argument", ts.lineno)
+			}
+			var err error
+			timeout, err = time.ParseDuration(args[idx+1])
+			if err != nil {
+				ts.t.Fatalf("script:%d: repeat: invalid timeout %q: %v", ts.lineno, args[idx+1], err)
+			}
+			idx += 2
+		case "-parallel":
+			if idx+1 >= len(args) {
+				ts.t.Fatalf("script:%d: repeat: -parallel requires a count", ts.lineno)
+			}
+			var err error
+			parallel, err = strconv.Atoi(args[idx+1])
+			if err != nil || parallel < 1 {
+				ts.t.Fatalf("script:%d: repeat: invalid parallel count %q", ts.lineno, args[idx+1])
+			}
+			idx += 2
+		default:
+			goto doneFlags
+		}
 	}
+doneFlags:
 
 	if idx >= len(args) {
-		ts.t.Fatalf("script:%d: usage: repeat [-all] COUNT COMMAND...", ts.lineno)
+		ts.t.Fatalf("script:%d: usage: repeat [-all] [-parallel N] [-timeout duration] COUNT COMMAND...", ts.lineno)
 	}
 
 	count, err := strconv.Atoi(args[idx])
@@ -1232,7 +1438,7 @@ func (ts *TestScript) cmdRepeat(neg bool, args []string) {
 	idx++
 
 	if idx >= len(args) {
-		ts.t.Fatalf("script:%d: usage: repeat [-all] COUNT COMMAND...", ts.lineno)
+		ts.t.Fatalf("script:%d: usage: repeat [-all] [-parallel N] [-timeout duration] COUNT COMMAND...", ts.lineno)
 	}
 
 	subcmd := args[idx]
@@ -1240,23 +1446,39 @@ func (ts *TestScript) cmdRepeat(neg bool, args []string) {
 
 	switch subcmd {
 	case "exec":
-		ts.repeatExec(neg, count, runAll, subargs)
+		ts.repeatExec(neg, count, runAll, timeout, subargs)
 	case "http":
-		ts.repeatHTTP(neg, count, runAll, subargs)
+		if parallel > 1 {
+			ts.repeatHTTPParallel(neg, count, runAll, timeout, parallel, subargs)
+		} else {
+			ts.repeatHTTP(neg, count, runAll, timeout, subargs)
+		}
 	default:
 		ts.t.Fatalf("script:%d: repeat only supports exec and http", ts.lineno)
 	}
 }
 
-func (ts *TestScript) repeatExec(neg bool, count int, runAll bool, args []string) {
+func (ts *TestScript) repeatExec(neg bool, count int, runAll bool, timeout time.Duration, args []string) {
 	if len(args) == 0 {
 		ts.t.Fatalf("script:%d: repeat exec: missing command", ts.lineno)
+	}
+
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 
 	var passed, failed int
 	var firstFailIter int
 
 	for i := 1; i <= count; i++ {
+		if err := ctx.Err(); err != nil {
+			ts.t.Fatalf("script:%d: repeat exec: timeout after %d/%d iterations", ts.lineno, i-1, count)
+			return
+		}
+
 		stdout, stderr, err := ts.exec(args[0], args[1:]...)
 		if err != nil {
 			failed++
@@ -1281,9 +1503,9 @@ func (ts *TestScript) repeatExec(neg bool, count int, runAll bool, args []string
 	ts.repeatFinish(neg, count, passed, failed, firstFailIter)
 }
 
-func (ts *TestScript) repeatHTTP(neg bool, count int, runAll bool, args []string) {
+func (ts *TestScript) repeatHTTP(neg bool, count int, runAll bool, timeout time.Duration, args []string) {
 	if len(args) < 2 {
-		ts.t.Fatalf("script:%d: repeat http: usage: repeat [-all] COUNT http METHOD URL [flags...]", ts.lineno)
+		ts.t.Fatalf("script:%d: repeat http: usage: repeat [-all] [-timeout duration] COUNT http METHOD URL [flags...]", ts.lineno)
 	}
 
 	method := args[0]
@@ -1293,10 +1515,22 @@ func (ts *TestScript) repeatHTTP(neg bool, count int, runAll bool, args []string
 	url := args[1]
 	flags := args[2:]
 
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	var passed, failed int
 	var firstFailIter int
 
 	for i := 1; i <= count; i++ {
+		if err := ctx.Err(); err != nil {
+			ts.t.Fatalf("script:%d: repeat http: timeout after %d/%d iterations", ts.lineno, i-1, count)
+			return
+		}
+
 		statusCode, err := ts.doHTTP(method, url, flags)
 		ok := err == nil && statusCode >= 200 && statusCode < 300
 
@@ -1328,6 +1562,75 @@ func (ts *TestScript) repeatHTTP(neg bool, count int, runAll bool, args []string
 	}
 
 	ts.repeatFinish(neg, count, passed, failed, firstFailIter)
+}
+
+func (ts *TestScript) repeatHTTPParallel(neg bool, count int, runAll bool, timeout time.Duration, parallel int, args []string) {
+	if len(args) < 2 {
+		ts.t.Fatalf("script:%d: repeat http: usage: repeat [-parallel N] [-timeout duration] COUNT http METHOD URL [flags...]", ts.lineno)
+	}
+
+	method := args[0]
+	if !validHTTPMethods[method] {
+		ts.t.Fatalf("script:%d: repeat http: invalid method %q", ts.lineno, method)
+	}
+	rawURL := args[1]
+	flags := args[2:]
+
+	// Pre-parse flags so goroutines don't touch ts state.
+	bodyData, headers, err := ts.parseHTTPFlags(flags)
+	if err != nil {
+		ts.t.Fatalf("script:%d: repeat http: %v", ts.lineno, err)
+		return
+	}
+
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	var passed, failed atomic.Int32
+	var firstFailOnce sync.Once
+	var firstFailIter int
+
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+
+	for i := 1; i <= count; i++ {
+		if err := ctx.Err(); err != nil {
+			ts.t.Fatalf("script:%d: repeat http: timeout after dispatching %d/%d iterations", ts.lineno, i-1, count)
+			return
+		}
+
+		wg.Add(1)
+		iter := i
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+
+			statusCode, herr := ts.doHTTPRaw(method, rawURL, bodyData, headers)
+			ok := herr == nil && statusCode >= 200 && statusCode < 300
+
+			if !ok {
+				failed.Add(1)
+				firstFailOnce.Do(func() {
+					firstFailIter = iter
+					if herr != nil {
+						ts.t.Logf("[repeat iteration %d/%d FAIL]\n  error: %v", iter, count, herr)
+					} else {
+						ts.t.Logf("[repeat iteration %d/%d FAIL]\n[http %d]", iter, count, statusCode)
+					}
+				})
+			} else {
+				passed.Add(1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	ts.repeatFinish(neg, count, int(passed.Load()), int(failed.Load()), firstFailIter)
 }
 
 // repeatFinish writes the summary to stderr and handles pass/fail logic
@@ -1440,8 +1743,29 @@ func tempEnvName() string {
 	}
 }
 
-// exec executes a command and returns stdout, stderr, and any error
+// parseExecTimeout extracts a -timeout flag from exec args.
+// Returns the timeout duration (0 means no timeout) and the remaining args.
+// args[0] is always the command name ("exec"), preserved in the returned slice.
+func (ts *TestScript) parseExecTimeout(args []string) (time.Duration, []string) {
+	// args = ["exec", "-timeout", "30s", "push", ...]
+	//   or   ["exec", "push", ...]
+	if len(args) >= 4 && args[1] == "-timeout" {
+		d, err := time.ParseDuration(args[2])
+		if err != nil {
+			ts.t.Fatalf("script:%d: exec: invalid timeout %q: %v", ts.lineno, args[2], err)
+		}
+		return d, append(args[:1], args[3:]...)
+	}
+	return 0, args
+}
+
+// exec executes a command and returns stdout, stderr, and any error.
 func (ts *TestScript) exec(name string, args ...string) (stdout, stderr string, err error) {
+	return ts.execWithTimeout(0, name, args...)
+}
+
+// execWithTimeout executes a command with an optional timeout.
+func (ts *TestScript) execWithTimeout(timeout time.Duration, name string, args ...string) (stdout, stderr string, err error) {
 	cmd, err := ts.buildExecCmd(name, args)
 	if err != nil {
 		return "", "", err
@@ -1451,7 +1775,13 @@ func (ts *TestScript) exec(name string, args ...string) (stdout, stderr string, 
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
-	err = cmd.Run()
+	if timeout > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		err = ts.waitOrStop(ctx, cmd, 2*time.Second)
+	} else {
+		err = cmd.Run()
+	}
 	return stdoutBuf.String(), stderrBuf.String(), err
 }
 
@@ -1526,8 +1856,11 @@ func (ts *TestScript) waitOrStop(ctx context.Context, cmd *exec.Cmd, interrupt t
 				cmd.Process.Signal(os.Interrupt)
 				// Give it time to stop gracefully
 				select {
-				case <-done:
-					return nil
+				case waitErr := <-done:
+					if waitErr != nil {
+						return waitErr
+					}
+					return ctx.Err()
 				case <-time.After(interrupt):
 					cmd.Process.Kill()
 				}

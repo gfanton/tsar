@@ -62,7 +62,7 @@ Each `.tsar` file in the directory becomes a subtest.
 
 | Command | Description |
 |---------|-------------|
-| `http METHOD URL [-body FILE] [-header "K: V"]...` | Perform HTTP request |
+| `http METHOD URL [-body FILE] [-upload FIELD=FILE]... [-header "K: V"]...` | Perform HTTP request |
 | `httpstatus CODE` | Assert last HTTP response status code |
 | `httpheader NAME VALUE` | Assert last HTTP response header contains value |
 
@@ -80,6 +80,10 @@ stdout result
 ! http GET $SERVER/missing
 httpstatus 404
 stdout "not found"
+
+# Upload a file as multipart/form-data
+http POST $SERVER/upload -upload file=document.txt
+httpstatus 200
 ```
 
 ### Repeat / Stress Testing
