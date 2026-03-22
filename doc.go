@@ -65,6 +65,7 @@ attached under the given form field name. The file path is relative to the
 test's work directory. Multiple -upload flags can be used. Cannot be combined
 with -body.
 
+	httpbody FILE                            Write last HTTP response body to file
 	httpstatus CODE                         Assert last HTTP response status code
 	httpheader NAME VALUE                   Assert last HTTP response header contains value
 

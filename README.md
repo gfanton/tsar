@@ -63,6 +63,7 @@ Each `.tsar` file in the directory becomes a subtest.
 | Command | Description |
 |---------|-------------|
 | `http METHOD URL [-body FILE] [-upload FIELD=FILE]... [-header "K: V"]...` | Perform HTTP request |
+| `httpbody FILE` | Write last HTTP response body to file |
 | `httpstatus CODE` | Assert last HTTP response status code |
 | `httpheader NAME VALUE` | Assert last HTTP response header contains value |
 

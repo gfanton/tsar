@@ -554,6 +554,7 @@ var builtinCmds = map[string]func(*TestScript, bool, []string){
 	"exists":     (*TestScript).cmdExists,
 	"grep":       (*TestScript).cmdGrep,
 	"http":       (*TestScript).cmdHTTP,
+	"httpbody":   (*TestScript).cmdHTTPBody,
 	"httpheader": (*TestScript).cmdHTTPHeader,
 	"httpstatus": (*TestScript).cmdHTTPStatus,
 	"logfile":    (*TestScript).cmdLogfile,
@@ -1381,6 +1382,20 @@ func (ts *TestScript) cmdHTTPHeader(neg bool, args []string) {
 		} else {
 			ts.t.Fatalf("script:%d: httpheader %s: value %q does not contain %q", ts.lineno, name, got, want)
 		}
+	}
+}
+
+func (ts *TestScript) cmdHTTPBody(neg bool, args []string) {
+	if len(args) != 2 {
+		ts.t.Fatalf("script:%d: usage: httpbody FILE", ts.lineno)
+	}
+	if ts.httpResp.status == "" {
+		ts.t.Fatalf("script:%d: httpbody: no HTTP response (run http first)", ts.lineno)
+	}
+
+	path := ts.mkabs(args[1])
+	if err := os.WriteFile(path, []byte(ts.httpResp.body), 0644); err != nil {
+		ts.t.Fatalf("script:%d: httpbody: write %s: %v", ts.lineno, args[1], err)
 	}
 }
 
