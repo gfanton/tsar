@@ -1197,9 +1197,13 @@ func (ts *TestScript) doHTTP(method, url string, flags []string) (int, error) {
 			if err != nil {
 				return 0, fmt.Errorf("-upload create form file: %w", err)
 			}
-			fw.Write(data)
+			if _, err := fw.Write(data); err != nil {
+				return 0, fmt.Errorf("-upload write form data: %w", err)
+			}
 		}
-		mw.Close()
+		if err := mw.Close(); err != nil {
+			return 0, fmt.Errorf("-upload close multipart: %w", err)
+		}
 		body = bytes.NewReader(buf.Bytes())
 		headers = append(headers, "Content-Type: "+mw.FormDataContentType())
 	} else if bodyFile != "" {
@@ -1295,9 +1299,13 @@ func (ts *TestScript) parseHTTPFlags(flags []string) (bodyData []byte, headers [
 			if createErr != nil {
 				return nil, nil, fmt.Errorf("-upload create form file: %w", createErr)
 			}
-			fw.Write(data)
+			if _, err := fw.Write(data); err != nil {
+				return nil, nil, fmt.Errorf("-upload write form data: %w", err)
+			}
 		}
-		mw.Close()
+		if err := mw.Close(); err != nil {
+			return nil, nil, fmt.Errorf("-upload close multipart: %w", err)
+		}
 		bodyData = buf.Bytes()
 		headers = append(headers, "Content-Type: "+mw.FormDataContentType())
 	} else if bodyFile != "" {
